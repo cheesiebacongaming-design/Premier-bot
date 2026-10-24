@@ -1,0 +1,14 @@
+{
+  "stage": "V26A6",
+  "note": "Queue windows differ by zone. Find yours in the Premier tab in-game.",
+  "weeks": [
+    {"label": "Week 1", "map": "Bind",    "start": "2026-10-21", "end": "2026-10-25"},
+    {"label": "Week 2", "map": "Corrode", "start": "2026-10-28", "end": "2026-11-01"},
+    {"label": "Week 3", "map": "Sunset",  "start": "2026-11-04", "end": "2026-11-08"},
+    {"label": "Week 4", "map": "Haven",   "start": "2026-11-11", "end": "2026-11-15"},
+    {"label": "Week 5", "map": "Summit",  "start": "2026-11-18", "end": "2026-11-22"},
+    {"label": "Week 6", "map": "Abyss",   "start": "2026-11-25", "end": "2026-11-29"},
+    {"label": "Week 7", "map": "Lotus",   "start": "2026-12-02", "end": "2026-12-05"},
+    {"label": "Playoffs", "map": "Playoffs Tournament", "start": "2026-12-06", "end": "2026-12-06"}
+  ]
+}
