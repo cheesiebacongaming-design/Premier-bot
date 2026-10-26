@@ -35,6 +35,7 @@ CACHE_FILE = Path("cache.json")
 SCHEDULE_FILE = Path("schedule.json")
 SEASON_FILE = Path("season.json")  # edit this each act
 ACCOUNTS_FILE = Path("accounts.json")  # Discord user -> Riot ID
+AGENTS_FILE = Path("agents.json")  # map -> {Discord user -> agent}
 ICON_DIR = Path("icons")
 ICON_DIR.mkdir(exist_ok=True)
 
@@ -345,10 +346,11 @@ async def icon_maps():
                 tiers = (await r.json())["data"]
         return {
             "agents": {a["uuid"].lower(): a["displayIcon"] for a in agents},
+            "agent_names": {a["uuid"].lower(): a["displayName"] for a in agents},
             "tiers": {str(t["tier"]): t.get("smallIcon") for t in tiers[-1]["tiers"]},
         }
 
-    return await cached("icons:maps", 7 * 86400, fetch)
+    return await cached("icons:maps2", 7 * 86400, fetch)
 
 
 async def icon_img(url, size):
@@ -897,6 +899,165 @@ async def findteam(interaction: discord.Interaction, riot_name: str, riot_tag: s
         await interaction.followup.send(str(e)[:1800])
 
 
+FALLBACK_AGENTS = [
+    "Astra", "Breach", "Brimstone", "Chamber", "Clove", "Cypher", "Deadlock", "Fade", "Gekko", "Harbor",
+    "Iso", "Jett", "KAY/O", "Killjoy", "Neon", "Omen", "Phoenix", "Raze", "Reyna", "Sage", "Skye",
+    "Sova", "Tejo", "Viper", "Vyse", "Waylay", "Yoru",
+]
+
+
+async def agent_names():
+    try:
+        maps = await asyncio.wait_for(icon_maps(), timeout=2.5)
+        names = sorted(maps.get("agent_names", {}).values())
+        if names:
+            return names
+    except Exception:
+        pass
+    return FALLBACK_AGENTS
+
+
+def load_agents():
+    try:
+        return json.loads(AGENTS_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_agents(data):
+    AGENTS_FILE.write_text(json.dumps(data, indent=1))
+
+
+def current_week():
+    season = load_season()
+    if not season:
+        return None
+    today = datetime.now(timezone.utc).date().isoformat()
+    return next((w for w in season["weeks"] if w["end"] >= today), None)
+
+
+def resolve_map(text):
+    """Map name from typed text (matched against season.json), or this week's map."""
+    season = load_season()
+    if text:
+        if not season:
+            return text.strip().title()
+        return next((w["map"] for w in season["weeks"] if w["map"].lower() == text.strip().lower()), None)
+    week = current_week()
+    return week["map"] if week else None
+
+
+NO_MAP = "I couldn't work out the map. Pick one from the list that appears as you type, or check season.json."
+
+
+@tree.command(name="agent", description="Pick your agent for a Premier map")
+@app_commands.describe(agent_name="The agent you'll play", map_name="Map (default: the current or next map)")
+async def agent_cmd(interaction: discord.Interaction, agent_name: str, map_name: str = ""):
+    agent = next((n for n in await agent_names() if n.lower() == agent_name.strip().lower()), None)
+    if not agent:
+        return await interaction.response.send_message(
+            f"I don't know an agent called {agent_name}. Start typing to see the list.", ephemeral=True
+        )
+    picked_map = resolve_map(map_name)
+    if not picked_map:
+        return await interaction.response.send_message(NO_MAP, ephemeral=True)
+    data = load_agents()
+    picks = data.setdefault(picked_map, {})
+    me = str(interaction.user.id)
+    for uid, taken in picks.items():
+        if uid != me and taken.lower() == agent.lower():
+            return await interaction.response.send_message(
+                f"{agent} is already taken on {picked_map} by <@{uid}>. Pick another agent.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+    picks[me] = agent
+    save_agents(data)
+    await interaction.response.send_message(
+        f"{interaction.user.mention} will play **{agent}** on **{picked_map}**. ({len(picks)} picked, /lineup to see everyone)",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@agent_cmd.autocomplete("agent_name")
+async def agent_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=n, value=n) for n in await agent_names() if current.lower() in n.lower()
+    ][:25]
+
+
+@tree.command(name="lineup", description="See who is playing which agent on a map")
+@app_commands.describe(map_name="Map (default: the current or next map)")
+async def lineup(interaction: discord.Interaction, map_name: str = ""):
+    picked_map = resolve_map(map_name)
+    if not picked_map:
+        return await interaction.response.send_message(NO_MAP, ephemeral=True)
+    picks = load_agents().get(picked_map, {})
+    embed = discord.Embed(title=f"Lineup: {picked_map}", colour=0xFF4655)
+    season = load_season()
+    week = next((w for w in season["weeks"] if w["map"] == picked_map), None) if season else None
+    if week:
+        embed.description = f"{week['label']} ({fmt_range(week['start'], week['end'])})\n\n"
+    else:
+        embed.description = ""
+    if not picks:
+        embed.description += "Nobody has picked an agent yet. Use /agent."
+    else:
+        accounts = load_accounts()
+        lines = []
+        for uid, agent in picks.items():
+            acc = accounts.get(uid)
+            riot = f" ({acc['name']}#{acc['tag']})" if acc else ""
+            lines.append(f"<@{uid}>{riot} \u2192 **{agent}**")
+        embed.description += "\n".join(lines)
+        embed.set_footer(text=f"{len(picks)}/5 picked")
+    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="clearagent", description="Remove your agent pick for a map")
+@app_commands.describe(map_name="Map (default: the current or next map)")
+async def clearagent(interaction: discord.Interaction, map_name: str = ""):
+    picked_map = resolve_map(map_name)
+    if not picked_map:
+        return await interaction.response.send_message(NO_MAP, ephemeral=True)
+    data = load_agents()
+    if data.get(picked_map, {}).pop(str(interaction.user.id), None) is None:
+        return await interaction.response.send_message(f"You hadn't picked an agent for {picked_map}.", ephemeral=True)
+    save_agents(data)
+    await interaction.response.send_message(f"Cleared your pick for {picked_map}.", ephemeral=True)
+
+
+for _cmd in (agent_cmd, lineup, clearagent):
+    _cmd.autocomplete("map_name")(map_autocomplete)
+
+
+HELP_SECTIONS = [
+    ("Premier", ["schedule", "results", "mapresults", "agent", "lineup", "clearagent"]),
+    ("Players", ["register", "unregister", "accounts", "rank", "player"]),
+    ("Server managers", ["setschedule", "clearcache"]),
+    ("Troubleshooting", ["findteam", "debug"]),
+]
+
+
+@tree.command(name="help", description="List all commands")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="Premier bot commands", colour=0xFF4655)
+    listed = {n for _, names in HELP_SECTIONS for n in names}
+    sections = list(HELP_SECTIONS) + [("Other", [c.name for c in tree.get_commands() if c.name not in listed])]
+    for title, names in sections:
+        lines = []
+        for n in names:
+            cmd = tree.get_command(n)
+            if not cmd:
+                continue
+            params = " ".join(f"<{p.display_name}>" if p.required else f"[{p.display_name}]" for p in cmd.parameters)
+            lines.append(f"`/{n}{' ' + params if params else ''}` {cmd.description}")
+        if lines:
+            embed.add_field(name=title, value="\n".join(lines)[:1024], inline=False)
+    embed.set_footer(text="<required> [optional]")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @tree.command(name="debug", description="Dump raw API data (to check field names)")
 @app_commands.choices(
     what=[app_commands.Choice(name="schedule", value="schedule"), app_commands.Choice(name="history", value="history")]
@@ -922,6 +1083,7 @@ async def on_ready():
         await tree.sync(guild=guild)
     else:
         await tree.sync()
+    asyncio.create_task(icon_maps())  # warm the agent/rank icon cache
     print(f"Logged in as {client.user}")
     print("Team lookup:", f"ID {TEAM_ID}" if TEAM_ID else f"name {TEAM_NAME}#{TEAM_TAG}")
 
