@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 import discord
@@ -34,28 +34,48 @@ X_KEYWORD = os.getenv("X_KEYWORD", "premier").lower()  # tweet must contain this
 CACHE_FILE = Path("cache.json")
 SCHEDULE_FILE = Path("schedule.json")
 SEASON_FILE = Path("season.json")  # edit this each act
+PLAYBOOK_FILE = Path("playbooks.json")
 ACCOUNTS_FILE = Path("accounts.json")  # Discord user -> Riot ID
 AGENTS_FILE = Path("agents.json")  # map -> {Discord user -> agent}
 ICON_DIR = Path("icons")
 ICON_DIR.mkdir(exist_ok=True)
 
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+class BotClient(discord.Client):
+    async def setup_hook(self):
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+        self.http_session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300))
+        self.x_session = aiohttp.ClientSession(timeout=timeout)
+
+    async def close(self):
+        for session in (getattr(self, "http_session", None), getattr(self, "x_session", None)):
+            if session and not session.closed:
+                await session.close()
+        save_task = globals().get("_cache_save_task")
+        if save_task and not save_task.done():
+            await save_task
+        await super().close()
+
+
+client = BotClient(intents=intents)
 tree = app_commands.CommandTree(client)
 sem = asyncio.Semaphore(3)  # be gentle with the rate limit
+_cache_locks = {}
+_icon_locks = {}
+_cache_save_task = None
+_cache_generation = 0
 
 
 # ---------- API helpers ----------
 async def api(path: str, **params):
     async with sem:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                BASE + path, headers={"Authorization": HENRIK_KEY}, params=params
-            ) as r:
-                body = await r.json()
-                if r.status != 200:
-                    raise RuntimeError(f"API {r.status}: {body.get('errors') or body}")
-                return body["data"]
+        async with client.http_session.get(
+            BASE + path, headers={"Authorization": HENRIK_KEY}, params=params
+        ) as r:
+            body = await r.json()
+            if r.status != 200:
+                raise RuntimeError(f"API {r.status}: {body.get('errors') or body}")
+            return body["data"]
 
 
 # ---------- Cache (memory + disk) ----------
@@ -65,26 +85,44 @@ except (FileNotFoundError, ValueError):
     _cache = {}
 
 
-def _save():
-    CACHE_FILE.write_text(json.dumps(_cache))
+
+async def _flush_cache():
+    await asyncio.sleep(0.3)
+    while True:
+        generation = _cache_generation
+        payload = json.dumps(_cache)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, CACHE_FILE.write_text, payload)
+        if generation == _cache_generation:
+            return
+        await asyncio.sleep(0.05)
+
+
+def _schedule_cache_save():
+    global _cache_save_task, _cache_generation
+    _cache_generation += 1
+    if _cache_save_task is None or _cache_save_task.done():
+        _cache_save_task = asyncio.create_task(_flush_cache())
 
 
 async def cached(key, ttl, fn):
     """Return a fresh cached value, else call fn(). ttl=None means keep forever.
     If fn() fails and a stale value exists, the stale value is returned."""
-    hit = _cache.get(key)
-    now = time.time()
-    if hit and (hit["ttl"] is None or now - hit["t"] < hit["ttl"]):
-        return hit["data"]
-    try:
-        data = await fn()
-    except Exception:
-        if hit:
+    lock = _cache_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        hit = _cache.get(key)
+        now = time.time()
+        if hit and (hit["ttl"] is None or now - hit["t"] < hit["ttl"]):
             return hit["data"]
-        raise
-    _cache[key] = {"t": now, "ttl": ttl, "data": data}
-    _save()
-    return data
+        try:
+            data = await fn()
+        except Exception:
+            if hit:
+                return hit["data"]
+            raise
+        _cache[key] = {"t": time.time(), "ttl": ttl, "data": data}
+        _schedule_cache_save()
+        return data
 
 
 def cached_api(path, ttl, **params):
@@ -92,16 +130,15 @@ def cached_api(path, ttl, **params):
 
 
 async def x_get(path, **params):
-    async with aiohttp.ClientSession() as s:
-        async with s.get(
-            "https://api.twitter.com/2" + path,
-            headers={"Authorization": f"Bearer {X_BEARER}"},
-            params=params,
-        ) as r:
-            body = await r.json()
-            if r.status != 200:
-                raise RuntimeError(f"X API {r.status}: {body}")
-            return body
+    async with client.x_session.get(
+        "https://api.twitter.com/2" + path,
+        headers={"Authorization": f"Bearer {X_BEARER}"},
+        params=params,
+    ) as r:
+        body = await r.json()
+        if r.status != 200:
+            raise RuntimeError(f"X API {r.status}: {body}")
+        return body
 
 
 async def latest_schedule_tweet():
@@ -176,17 +213,17 @@ async def history_from_players():
     """Build the match list from the roster's own Premier match histories."""
     if ROSTER:
         found, err = {}, None
-        for entry in ROSTER:
+        async def fetch_player(entry):
             name, _, tag = entry.rpartition("#")
-            try:
-                items = await cached_api(
-                    f"/valorant/v1/stored-matches/{AFFINITY}/{quote(name.strip())}/{quote(tag.strip())}",
-                    600,
-                    mode="premier",
-                    size=20,
-                )
-            except Exception as e:
-                err = e
+            return await cached_api(
+                f"/valorant/v1/stored-matches/{AFFINITY}/{quote(name.strip())}/{quote(tag.strip())}",
+                600, mode="premier", size=20,
+            )
+
+        results = await asyncio.gather(*(fetch_player(entry) for entry in ROSTER), return_exceptions=True)
+        for items in results:
+            if isinstance(items, Exception):
+                err = items
                 continue
             for item in items or []:
                 meta = item.get("meta", {})
@@ -197,14 +234,16 @@ async def history_from_players():
         return sorted(found.values(), key=lambda m: m["started_at"] or "", reverse=True)
     team = await team_data()
     puuids = [m["puuid"] for m in (team.get("member") or team.get("members") or []) if m.get("puuid")][:5]
+    async def fetch_player_matches(puuid):
+        return await cached_api(
+            f"/valorant/v4/by-puuid/matches/{AFFINITY}/pc/{puuid}", 600, mode="premier", size=10
+        )
+
+    results = await asyncio.gather(*(fetch_player_matches(p) for p in puuids), return_exceptions=True)
     seen, last_error = {}, None
-    for puuid in puuids:
-        try:
-            items = await cached_api(
-                f"/valorant/v4/by-puuid/matches/{AFFINITY}/pc/{puuid}", 600, mode="premier", size=10
-            )
-        except Exception as e:
-            last_error = e
+    for items in results:
+        if isinstance(items, Exception):
+            last_error = items
             continue
         for item in items or []:
             meta = item.get("metadata", {})
@@ -339,11 +378,15 @@ async def icon_maps():
     """agent uuid -> icon url, rank tier -> icon url (valorant-api.com, cached a week)."""
 
     async def fetch():
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://valorant-api.com/v1/agents?isPlayableCharacter=true") as r:
-                agents = (await r.json())["data"]
-            async with s.get("https://valorant-api.com/v1/competitivetiers") as r:
-                tiers = (await r.json())["data"]
+        async def get_json(url):
+            async with client.http_session.get(url) as r:
+                r.raise_for_status()
+                return await r.json()
+        agents_data, tiers_data = await asyncio.gather(
+            get_json("https://valorant-api.com/v1/agents?isPlayableCharacter=true"),
+            get_json("https://valorant-api.com/v1/competitivetiers"),
+        )
+        agents, tiers = agents_data["data"], tiers_data["data"]
         return {
             "agents": {a["uuid"].lower(): a["displayIcon"] for a in agents},
             "agent_names": {a["uuid"].lower(): a["displayName"] for a in agents},
@@ -358,9 +401,10 @@ async def icon_img(url, size):
         return None
     path = ICON_DIR / (hashlib.md5(url.encode()).hexdigest() + ".png")
     try:
-        if not path.exists():
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url) as r:
+        lock = _icon_locks.setdefault(url, asyncio.Lock())
+        async with lock:
+            if not path.exists():
+                async with client.http_session.get(url) as r:
                     if r.status != 200:
                         return None
                     path.write_bytes(await r.read())
@@ -461,7 +505,9 @@ async def render_scoreboard(s, filename):
         keys.append(("t", r["tier"]))
         jobs.append(icon_img(maps["tiers"].get(str(r["tier"])), 30))
     icons = dict(zip(keys, await asyncio.gather(*jobs)))
-    return discord.File(draw_scoreboard(s, icons), filename=filename)
+    loop = asyncio.get_running_loop()
+    image = await loop.run_in_executor(None, draw_scoreboard, s, icons)
+    return discord.File(image, filename=filename)
 
 
 async def load_summaries(matches):
@@ -576,7 +622,7 @@ async def clearcache(interaction: discord.Interaction):
     # keep permanent match summaries, drop everything that expires
     for k in [k for k, v in _cache.items() if v["ttl"] is not None]:
         del _cache[k]
-    _save()
+    _schedule_cache_save()
     await interaction.response.send_message("Cleared. Match summaries stay cached.", ephemeral=True)
 
 
@@ -928,6 +974,24 @@ def save_agents(data):
     AGENTS_FILE.write_text(json.dumps(data, indent=1))
 
 
+def matching_map_key(data, map_name):
+    normalized = map_name.strip().casefold()
+    return next((key for key in data if key.strip().casefold() == normalized), map_name)
+
+
+def assign_agent(map_name, user_id, agent):
+    data = load_agents()
+    map_name = matching_map_key(data, map_name)
+    picks = data.setdefault(map_name, {})
+    user_id = str(user_id)
+    for uid, taken in picks.items():
+        if uid != user_id and taken.lower() == agent.lower():
+            return f"{agent} is already taken on {map_name} by <@{uid}>. Pick another agent.", len(picks)
+    picks[user_id] = agent
+    save_agents(data)
+    return None, len(picks)
+
+
 def current_week():
     season = load_season()
     if not season:
@@ -961,25 +1025,45 @@ async def agent_cmd(interaction: discord.Interaction, agent_name: str, map_name:
     picked_map = resolve_map(map_name)
     if not picked_map:
         return await interaction.response.send_message(NO_MAP, ephemeral=True)
-    data = load_agents()
-    picks = data.setdefault(picked_map, {})
-    me = str(interaction.user.id)
-    for uid, taken in picks.items():
-        if uid != me and taken.lower() == agent.lower():
-            return await interaction.response.send_message(
-                f"{agent} is already taken on {picked_map} by <@{uid}>. Pick another agent.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-    picks[me] = agent
-    save_agents(data)
+    conflict, count = assign_agent(picked_map, interaction.user.id, agent)
+    if conflict:
+        return await interaction.response.send_message(
+            conflict, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
     await interaction.response.send_message(
-        f"{interaction.user.mention} will play **{agent}** on **{picked_map}**. ({len(picks)} picked, /lineup to see everyone)",
+        f"{interaction.user.mention} will play **{agent}** on **{picked_map}**. ({count} picked, /lineup to see everyone)",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tree.command(name="assignagent", description="Assign an agent to a player (administrators only)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(user="Player to assign", agent_name="Agent to assign", map_name="Map (default: the current or next map)")
+async def assignagent(interaction: discord.Interaction, user: discord.Member, agent_name: str, map_name: str = ""):
+    if not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can use this command.", ephemeral=True)
+    agent = next((n for n in await agent_names() if n.lower() == agent_name.strip().lower()), None)
+    if not agent:
+        return await interaction.response.send_message(
+            f"I don't know an agent called {agent_name}. Start typing to see the list.", ephemeral=True
+        )
+    picked_map = resolve_map(map_name)
+    if not picked_map:
+        return await interaction.response.send_message(NO_MAP, ephemeral=True)
+    conflict, count = assign_agent(picked_map, user.id, agent)
+    if conflict:
+        return await interaction.response.send_message(
+            conflict, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
+    await interaction.response.send_message(
+        f"Assigned **{agent}** to {user.mention} on **{picked_map}**. ({count} picked, /lineup to see everyone)",
+        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
 @agent_cmd.autocomplete("agent_name")
+@assignagent.autocomplete("agent_name")
 async def agent_autocomplete(interaction: discord.Interaction, current: str):
     return [
         app_commands.Choice(name=n, value=n) for n in await agent_names() if current.lower() in n.lower()
@@ -992,7 +1076,8 @@ async def lineup(interaction: discord.Interaction, map_name: str = ""):
     picked_map = resolve_map(map_name)
     if not picked_map:
         return await interaction.response.send_message(NO_MAP, ephemeral=True)
-    picks = load_agents().get(picked_map, {})
+    agent_data = load_agents()
+    picks = agent_data.get(matching_map_key(agent_data, picked_map), {})
     embed = discord.Embed(title=f"Lineup: {picked_map}", colour=0xFF4655)
     season = load_season()
     week = next((w for w in season["weeks"] if w["map"] == picked_map), None) if season else None
@@ -1014,6 +1099,66 @@ async def lineup(interaction: discord.Interaction, map_name: str = ""):
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
+
+def load_playbooks():
+    try:
+        return json.loads(PLAYBOOK_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_playbooks(data):
+    PLAYBOOK_FILE.write_text(json.dumps(data, indent=1))
+
+
+@tree.command(name="playbook", description="Show the notes and links for a map")
+@app_commands.describe(map_name="Map to view")
+async def playbook(interaction: discord.Interaction, map_name: str):
+    picked_map = resolve_map(map_name)
+    if not picked_map:
+        return await interaction.response.send_message(NO_MAP, ephemeral=True)
+    data = load_playbooks()
+    entry = data.get(matching_map_key(data, picked_map))
+    if not entry:
+        return await interaction.response.send_message(f"No playbook has been created for {picked_map} yet.", ephemeral=True)
+    embed = discord.Embed(title=f"Playbook: {picked_map}", description=entry.get("notes") or "No notes added.", colour=0xFF4655)
+    links = entry.get("links") or []
+    if links:
+        rendered = "\n".join(f"• <{url}>" for url in links)
+        embed.add_field(name="Links", value=rendered[:1024], inline=False)
+    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="createplaybook", description="Create or replace a map playbook (administrators only)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(map_name="Map", notes="Strategy notes", links="URLs separated by spaces, commas, or new lines")
+async def createplaybook(interaction: discord.Interaction, map_name: str, notes: str, links: str = ""):
+    if not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can use this command.", ephemeral=True)
+    picked_map = resolve_map(map_name)
+    if not picked_map:
+        return await interaction.response.send_message(NO_MAP, ephemeral=True)
+    if len(notes) > 4000:
+        return await interaction.response.send_message("Notes must be 4,000 characters or fewer.", ephemeral=True)
+    urls = [part for part in links.replace(",", " ").split() if part]
+    invalid = [url for url in urls if urlsplit(url).scheme not in ("http", "https") or not urlsplit(url).netloc]
+    if invalid:
+        return await interaction.response.send_message("Links must be complete http:// or https:// URLs.", ephemeral=True)
+    if len("\n".join(f"• <{url}>" for url in urls)) > 1024:
+        return await interaction.response.send_message("The links are too long for one playbook. Shorten or remove some URLs.", ephemeral=True)
+    data = load_playbooks()
+    stored_map = matching_map_key(data, picked_map)
+    data[stored_map] = {"notes": notes.strip(), "links": urls}
+    save_playbooks(data)
+    await interaction.response.send_message(f"Saved the playbook for **{stored_map}**. Use /playbook to view it.", ephemeral=True)
+
+
+@playbook.autocomplete("map_name")
+@createplaybook.autocomplete("map_name")
+async def playbook_map_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=m, value=m) for m in season_maps() if current.lower() in m.lower()][:25]
+
+
 @tree.command(name="clearagent", description="Remove your agent pick for a map")
 @app_commands.describe(map_name="Map (default: the current or next map)")
 async def clearagent(interaction: discord.Interaction, map_name: str = ""):
@@ -1027,14 +1172,14 @@ async def clearagent(interaction: discord.Interaction, map_name: str = ""):
     await interaction.response.send_message(f"Cleared your pick for {picked_map}.", ephemeral=True)
 
 
-for _cmd in (agent_cmd, lineup, clearagent):
+for _cmd in (agent_cmd, assignagent, lineup, clearagent):
     _cmd.autocomplete("map_name")(map_autocomplete)
 
 
 HELP_SECTIONS = [
-    ("Premier", ["schedule", "results", "mapresults", "agent", "lineup", "clearagent"]),
+    ("Premier", ["schedule", "results", "mapresults", "agent", "lineup", "clearagent", "playbook"]),
     ("Players", ["register", "unregister", "accounts", "rank", "player"]),
-    ("Server managers", ["setschedule", "clearcache"]),
+    ("Server managers", ["assignagent", "createplaybook", "setschedule", "clearcache"]),
     ("Troubleshooting", ["findteam", "debug"]),
 ]
 
