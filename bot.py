@@ -6,6 +6,7 @@ import os
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from urllib.parse import quote, urlsplit
 
@@ -33,6 +34,7 @@ X_USERNAME = os.getenv("X_USERNAME")  # account that posts the Premier schedule 
 X_KEYWORD = os.getenv("X_KEYWORD", "premier").lower()  # tweet must contain this
 CACHE_FILE = Path("cache.json")
 SCHEDULE_FILE = Path("schedule.json")
+QUEUE_SCHEDULE_FILE = Path("queue_schedule.json")
 SEASON_FILE = Path("season.json")  # edit this each act
 PLAYBOOK_FILE = Path("playbooks.json")
 ACCOUNTS_FILE = Path("accounts.json")  # Discord user -> Riot ID
@@ -46,6 +48,7 @@ class BotClient(discord.Client):
         timeout = aiohttp.ClientTimeout(total=15, connect=5)
         self.http_session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300))
         self.x_session = aiohttp.ClientSession(timeout=timeout)
+        self.queue_reminder_task = asyncio.create_task(queue_reminder_loop())
 
     async def close(self):
         for session in (getattr(self, "http_session", None), getattr(self, "x_session", None)):
@@ -299,7 +302,7 @@ def build_row(p, total_rounds, fb=0):
     }
 
 
-def summarise(detail: dict, members: set):
+def summarise(detail: dict, members: set, premier_team_id=None, premier_team_name=None, premier_team_tag=None):
     """Work out which side was ours, the score, and both teams' scoreboards."""
     meta = detail.get("metadata", {})
     players = detail.get("players", [])
@@ -313,6 +316,24 @@ def summarise(detail: dict, members: set):
     if ours:
         side = max({p.get("team_id") for p in ours}, key=lambda t: sum(1 for p in ours if p.get("team_id") == t))
     teams = {t.get("team_id"): t for t in detail.get("teams", [])}
+    if side is None and premier_team_id:
+        side = next((
+            t.get("team_id") for t in detail.get("teams", [])
+            if str((t.get("premier_roster") or {}).get("id", "")) == str(premier_team_id)
+        ), None)
+        if side is not None:
+            ours = [p for p in players if p.get("team_id") == side]
+    if side is None and premier_team_name:
+        target_name = premier_team_name.casefold()
+        target_tag = (premier_team_tag or "").casefold()
+        side = next((
+            t.get("team_id") for t in detail.get("teams", [])
+            if (t.get("premier_roster") or {}).get("name", "").casefold() == target_name
+            and (not target_tag or not (t.get("premier_roster") or {}).get("tag")
+                 or (t.get("premier_roster") or {}).get("tag", "").casefold() == target_tag)
+        ), None)
+        if side is not None:
+            ours = [p for p in players if p.get("team_id") == side]
     mine = teams.get(side, {})
     other_id, theirs = next(((k, t) for k, t in teams.items() if k != side), (None, {}))
     rounds_won = (mine.get("rounds") or {}).get("won", 0)
@@ -600,20 +621,239 @@ async def schedule(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="setschedule", description="Paste the maps and times from the Premier tweet")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(text="The schedule text, e.g. Wed 8pm Ascent, Thu 8pm Bind")
-async def setschedule(interaction: discord.Interaction, text: str):
-    SCHEDULE_FILE.write_text(
-        json.dumps(
-            {
-                "text": text,
-                "set_by": interaction.user.display_name,
-                "set_at": datetime.now(timezone.utc).isoformat(),
-            }
+@tree.command(name="setschedule", description="Set Premier times and/or weekly queue reminders")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    text="Optional schedule text for /schedule, e.g. Wed 8pm Ascent",
+    days="Queue days, comma-separated (e.g. Tuesday,Thursday)",
+    local_time="Queue start time in 24-hour HH:MM format",
+    timezone_name="IANA time zone (e.g. Europe/London or America/Los_Angeles)",
+    channel="Channel for reminders (defaults to this channel)",
+)
+async def setschedule(
+    interaction: discord.Interaction,
+    text: str = "",
+    days: str = "",
+    local_time: str = "",
+    timezone_name: str = "",
+    channel: discord.TextChannel = None,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+    if not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can set the schedule.", ephemeral=True)
+
+    supplied = (days.strip(), local_time.strip(), timezone_name.strip())
+    if any(supplied) and not all(supplied):
+        return await interaction.response.send_message(
+            "For reminders, provide days, local_time, and timezone_name together.", ephemeral=True
         )
-    )
-    await interaction.response.send_message("Schedule updated. Use /schedule to view it.", ephemeral=True)
+    if not text.strip() and not all(supplied):
+        return await interaction.response.send_message(
+            "Set reminder days, local_time, and timezone_name, or provide schedule text for /schedule.", ephemeral=True
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    if text.strip():
+        SCHEDULE_FILE.write_text(json.dumps({
+            "text": text.strip(), "set_by": interaction.user.display_name, "set_at": now,
+        }))
+
+    if all(supplied):
+        weekdays = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+        day_lookup = {name.casefold(): i for i, name in enumerate(weekdays)}
+        day_lookup.update({name[:3].casefold(): i for i, name in enumerate(weekdays)})
+        try:
+            zone = ZoneInfo(timezone_name.strip())
+        except (ZoneInfoNotFoundError, ValueError):
+            return await interaction.response.send_message("I don't recognize that IANA time zone.", ephemeral=True)
+        try:
+            parsed_time = datetime.strptime(local_time.strip(), "%H:%M").time()
+        except ValueError:
+            return await interaction.response.send_message("Use 24-hour HH:MM for local_time, such as 20:00.", ephemeral=True)
+        day_values = []
+        for raw_day in days.split(","):
+            day = day_lookup.get(raw_day.strip().casefold())
+            if day is None:
+                return await interaction.response.send_message("Use weekday names separated by commas.", ephemeral=True)
+            if day not in day_values:
+                day_values.append(day)
+        if not day_values:
+            return await interaction.response.send_message("Add at least one queue day.", ephemeral=True)
+        target = channel or (interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None)
+        if target is None:
+            return await interaction.response.send_message("Choose a text channel for reminders.", ephemeral=True)
+        configs = load_queue_schedules()
+        configs[str(interaction.guild_id)] = {
+            "days": sorted(day_values), "time": parsed_time.strftime("%H:%M"),
+            "timezone": zone.key, "channel_id": target.id, "last_reminder_date": None,
+        }
+        save_queue_schedules(configs)
+
+    parts = []
+    if text.strip():
+        parts.append("Premier schedule text updated.")
+    if all(supplied):
+        day_names = ", ".join(weekdays[d] for d in sorted(set(day_values)))
+        parts.append(f"Reminders set for {day_names} at {parsed_time.strftime('%H:%M')} {zone.key} in {target.mention}, 30 minutes before queue.")
+    await interaction.response.send_message(" ".join(parts), ephemeral=True)
+
+
+@tree.command(name="testreminder", description="Post a test queue reminder showing agent picks and mentioning picked players (administrators only)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(channel="Where to post the test reminder (defaults to the configured reminder channel)")
+async def testreminder(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+    if not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can test reminders.", ephemeral=True)
+    config = load_queue_schedules().get(str(interaction.guild_id))
+    target = channel
+    if target is None and config:
+        target = interaction.guild.get_channel(int(config.get("channel_id", 0)))
+    if target is None:
+        return await interaction.response.send_message(
+            "No reminder channel is configured. Set one with /setschedule, or choose a channel for this test.", ephemeral=True
+        )
+    label = "Test queue reminder"
+    if config:
+        try:
+            zone = ZoneInfo(config["timezone"])
+            hour, minute = map(int, config["time"].split(":"))
+            days = ", ".join(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[d] for d in config["days"])
+            label = f"Test reminder · {days} at {hour:02d}:{minute:02d} {zone.key}"
+        except (KeyError, ValueError, ZoneInfoNotFoundError):
+            pass
+    await interaction.response.defer(ephemeral=True)
+    embed, picked_user_ids, lineup_file = await build_lineup_reminder(label, "This is a test reminder.", interaction.guild)
+    mentions = " ".join(f"<@{uid}>" for uid in picked_user_ids)
+    content = "Test queue reminder. Players with agent picks:" + (f" {mentions}" if mentions else " Nobody has picked an agent yet.")
+    send_args = {
+        "content": content,
+        "embed": embed,
+        "allowed_mentions": discord.AllowedMentions(users=[discord.Object(id=uid) for uid in picked_user_ids]),
+    }
+    if lineup_file:
+        send_args["file"] = lineup_file
+    await target.send(**send_args)
+    await interaction.followup.send(f"Test reminder posted in {target.mention}.", ephemeral=True)
+
+
+def load_queue_schedules():
+    try:
+        data = json.loads(QUEUE_SCHEDULE_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_queue_schedules(data):
+    QUEUE_SCHEDULE_FILE.write_text(json.dumps(data, indent=2))
+
+
+async def discord_display_name(guild, user_id):
+    member = guild.get_member(user_id) if guild else None
+    member = member or client.get_user(user_id)
+    if member:
+        return member.display_name
+    if guild:
+        try:
+            return (await guild.fetch_member(user_id)).display_name
+        except discord.DiscordException:
+            pass
+    return "Former server member"
+
+
+async def build_lineup_reminder(title, intro, guild=None):
+    embed = discord.Embed(title=title, description=intro, colour=0xFF4655)
+    week = current_week()
+    if not week:
+        embed.add_field(name="Lineup", value="No current map is available in season.json.", inline=False)
+        return embed, [], None
+
+    map_name = week["map"]
+    data = load_agents()
+    picks = data.get(matching_map_key(data, map_name), {})
+    picked_user_ids = []
+    lines = []
+    slots = []
+    for user_id, agent in sorted(picks.items(), key=lambda item: str(item[0])):
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            continue
+        picked_user_ids.append(uid)
+        player_name = await discord_display_name(guild, uid)
+        slots.append({"player": player_name, "agent": agent, "riot": ""})
+        lines.append(f"<@{uid}> — **{agent}**")
+
+    picked_count = len(slots)
+    while len(slots) < 5:
+        slots.append({"player": "Open slot", "agent": None, "riot": "Waiting for an agent pick"})
+    if not lines:
+        lines = ["Nobody has selected an agent yet. Use /agent to add a pick."]
+    embed.add_field(name=f"{map_name} lineup", value="\n".join(lines)[:1024], inline=False)
+    missing = max(0, 5 - picked_count)
+    embed.set_footer(text=f"{picked_count}/5 agent picks · {missing} missing")
+    week_label = f"{week['label']} · {fmt_range(week['start'], week['end'])}"
+    lineup_file = await lineup_card_file(map_name, week_label, slots)
+    embed.set_image(url="attachment://lineup.png")
+    return embed, picked_user_ids, lineup_file
+
+
+def next_queue_start(config, now_utc):
+    zone = ZoneInfo(config["timezone"])
+    local_now = now_utc.astimezone(zone)
+    hour, minute = map(int, config["time"].split(":"))
+    candidates = []
+    for offset in range(8):
+        day = local_now.date() + timedelta(days=offset)
+        if day.weekday() not in config["days"]:
+            continue
+        candidate = datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone)
+        if candidate > local_now:
+            candidates.append(candidate)
+    return min(candidates) if candidates else None
+
+
+async def queue_reminder_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        now = datetime.now(timezone.utc)
+        configs = load_queue_schedules()
+        dirty = False
+        for guild_id, config in configs.items():
+            try:
+                queue_start = next_queue_start(config, now)
+                if not queue_start:
+                    continue
+                seconds_until = (queue_start.astimezone(timezone.utc) - now).total_seconds()
+                local_date = queue_start.date().isoformat()
+                if 0 < seconds_until <= 30 * 60 and config.get("last_reminder_date") != local_date:
+                    channel_id = int(config["channel_id"])
+                    channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+                    label = queue_start.strftime("%A %H:%M %Z")
+                    guild = client.get_guild(int(guild_id))
+                    embed, picked_user_ids, lineup_file = await build_lineup_reminder(
+                        f"Queue reminder · {label}", "Queue window starts in about 30 minutes.", guild
+                    )
+                    mentions = " ".join(f"<@{uid}>" for uid in picked_user_ids)
+                    content = "Players with agent picks:" + (f" {mentions}" if mentions else " nobody has picked an agent yet.")
+                    send_args = {
+                        "content": content,
+                        "embed": embed,
+                        "allowed_mentions": discord.AllowedMentions(users=[discord.Object(id=uid) for uid in picked_user_ids]),
+                    }
+                    if lineup_file:
+                        send_args["file"] = lineup_file
+                    await channel.send(**send_args)
+                    config["last_reminder_date"] = local_date
+                    dirty = True
+            except (KeyError, ValueError, ZoneInfoNotFoundError, discord.DiscordException) as exc:
+                print(f"Queue reminder failed for guild {guild_id}: {exc}")
+        if dirty:
+            save_queue_schedules(configs)
+        await asyncio.sleep(60)
 
 
 @tree.command(name="clearcache", description="Force fresh data on the next command")
@@ -785,8 +1025,8 @@ def split_riot_id(text):
     return (name.strip(), tag.strip()) if sep and name.strip() and tag.strip() else None
 
 
-def resolve_player(caller, user, name, tag, region):
-    """Return (name, tag, region) from typed input, a mentioned member, or the caller's registered account."""
+def resolve_player(caller, member, name, tag, region):
+    """Return (name, tag, region) from typed input, a selected Discord member, or the caller's registered account."""
     if name and not tag and "#" in name:
         parts = split_riot_id(name)
         if parts:
@@ -795,7 +1035,7 @@ def resolve_player(caller, user, name, tag, region):
         return name, tag, region
     if name or tag:
         return None
-    acc = load_accounts().get(str((user or caller).id))
+    acc = load_accounts().get(str((member or caller).id))
     if not acc:
         return None
     return acc["name"], acc["tag"], region or acc.get("region", "")
@@ -851,11 +1091,13 @@ async def accounts_cmd(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="rank", description="Current and peak rank for any player")
-@app_commands.describe(name="Riot name, or Name#TAG (leave empty for your registered account)", tag="Tag (after the #)", region="eu, na, ap, kr, latam or br", user="A member who has registered")
-async def rank_cmd(interaction: discord.Interaction, name: str = "", tag: str = "", region: str = "", user: discord.Member = None):
+@tree.command(name="rank", description="Current and peak rank for a Riot ID, you, or a member with a linked account")
+@app_commands.describe(name="Riot name, or Name#TAG", tag="Tag (after the #)", region="eu, na, ap, kr, latam or br", member="Select or @mention a member; uses their /register account")
+async def rank_cmd(interaction: discord.Interaction, name: str = "", tag: str = "", region: str = "", member: discord.Member = None):
     await interaction.response.defer()
-    who = resolve_player(interaction.user, user, name, tag, region)
+    if member and not load_accounts().get(str(member.id)):
+        return await interaction.followup.send(f"{member.display_name} has not linked a Valorant account yet. They can use /register first.")
+    who = resolve_player(interaction.user, member, name, tag, region)
     if not who:
         return await interaction.followup.send(NO_PLAYER)
     name, tag, region = who
@@ -891,8 +1133,8 @@ async def rank_cmd(interaction: discord.Interaction, name: str = "", tag: str = 
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="player", description="Recent matches and averages for any player")
-@app_commands.describe(name="Riot name, or Name#TAG (leave empty for your registered account)", tag="Tag (after the #)", mode="Game mode (default competitive)", region="eu, na, ap, kr, latam or br", user="A member who has registered")
+@tree.command(name="player", description="Recent matches and averages for a Riot ID, you, or a member with a linked account")
+@app_commands.describe(name="Riot name, or Name#TAG", tag="Tag (after the #)", mode="Game mode (default competitive)", region="eu, na, ap, kr, latam or br", member="Select or @mention a member; uses their /register account")
 @app_commands.choices(
     mode=[
         app_commands.Choice(name="Competitive", value="competitive"),
@@ -900,9 +1142,11 @@ async def rank_cmd(interaction: discord.Interaction, name: str = "", tag: str = 
         app_commands.Choice(name="Premier", value="premier"),
     ]
 )
-async def player_cmd(interaction: discord.Interaction, name: str = "", tag: str = "", mode: app_commands.Choice[str] = None, region: str = "", user: discord.Member = None):
+async def player_cmd(interaction: discord.Interaction, name: str = "", tag: str = "", mode: app_commands.Choice[str] = None, region: str = "", member: discord.Member = None):
     await interaction.response.defer()
-    who = resolve_player(interaction.user, user, name, tag, region)
+    if member and not load_accounts().get(str(member.id)):
+        return await interaction.followup.send(f"{member.display_name} has not linked a Valorant account yet. They can use /register first.")
+    who = resolve_player(interaction.user, member, name, tag, region)
     if not who:
         return await interaction.followup.send(NO_PLAYER)
     name, tag, region = who
@@ -943,6 +1187,224 @@ async def findteam(interaction: discord.Interaction, riot_name: str, riot_tag: s
         await interaction.followup.send(f"```json\n{json.dumps(data, indent=1)[:1800]}\n```")
     except Exception as e:
         await interaction.followup.send(str(e)[:1800])
+
+
+def extract_premier_seasons(data):
+    """Normalize the Premier seasons endpoint into newest-first {id, name} records."""
+    source = data
+    if isinstance(source, dict):
+        source = source.get("seasons") or source.get("data") or source.get("premier_seasons") or source
+    if isinstance(source, dict):
+        if source.get("id") or source.get("season_id"):
+            source = [source]
+        else:
+            source = [dict(value, id=value.get("id") or value.get("season_id") or key)
+                      for key, value in source.items() if isinstance(value, dict)]
+    if not isinstance(source, list):
+        return []
+
+    records, seen = [], set()
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        nested = item.get("season") if isinstance(item.get("season"), dict) else {}
+        season_id = item.get("season_id") or item.get("id") or nested.get("id")
+        if not season_id or str(season_id) in seen:
+            continue
+        seen.add(str(season_id))
+        name = item.get("name") or item.get("short") or item.get("label") or nested.get("short") or str(season_id)
+        records.append({"id": str(season_id), "name": str(name)})
+    # HenrikDev returns Premier seasons oldest first; scout from the current season backwards.
+    return list(reversed(records))
+
+
+
+async def valorant_acts():
+    """Return VALORANT act seasons from valorant-api.com, newest act first."""
+    async def fetch():
+        async with client.http_session.get("https://valorant-api.com/v1/seasons") as response:
+            response.raise_for_status()
+            body = await response.json()
+            return body.get("data", [])
+    data = await cached("valorant:acts", 86400, fetch)
+    now = datetime.now(timezone.utc)
+    acts = []
+    for item in data:
+        if not (item.get("type") or "").casefold().endswith("act"):
+            continue
+        start = parse_time(item.get("startTime"))
+        end = parse_time(item.get("endTime"))
+        if not start or not end:
+            continue
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start <= now:
+            acts.append({
+                "id": item.get("uuid") or item.get("id"),
+                "name": item.get("displayName") or item.get("name") or "VALORANT Act",
+                "start": start,
+                "end": end,
+            })
+    return sorted(acts, key=lambda act: act["start"], reverse=True)
+
+
+@tree.command(name="scout", description="Scout a Premier team’s win rate and agent picks across VALORANT acts")
+@app_commands.describe(
+    team_name="Premier team name",
+    team_tag="Premier team tag",
+    acts="How many recent VALORANT acts to include (default: 1)",
+)
+async def scout(
+    interaction: discord.Interaction,
+    team_name: str,
+    team_tag: str,
+    acts: app_commands.Range[int, 1, 10] = 1,
+):
+    await interaction.response.defer()
+    team_name, team_tag = team_name.strip(), team_tag.strip()
+    if not team_name or not team_tag:
+        return await interaction.followup.send("Provide both the Premier team name and tag.")
+
+    team_endpoint = f"/valorant/v1/premier/{quote(team_name)}/{quote(team_tag)}"
+    team_v2_endpoint = f"/valorant/v2/premier/teams/{AFFINITY}/{quote(team_name)}/{quote(team_tag)}"
+    try:
+        try:
+            team = await cached_api(team_v2_endpoint, 86400)
+        except Exception:
+            team = await cached_api(team_endpoint, 86400)
+        premier_season_data = await cached_api(f"/valorant/v1/premier/seasons/{AFFINITY}", 86400)
+        act_list = await valorant_acts()
+    except Exception as exc:
+        return await interaction.followup.send(f"Couldn't look up **{team_name}#{team_tag}**: {str(exc)[:300]}")
+
+    selected_acts = act_list[:acts]
+    if not selected_acts:
+        return await interaction.followup.send("Couldn't find current or past VALORANT acts from the VALORANT API.")
+    premier_seasons = extract_premier_seasons(premier_season_data)
+    if not premier_seasons:
+        return await interaction.followup.send("Couldn't read Premier match history seasons from HenrikDev.")
+    # VALORANT acts usually overlap one or two Premier seasons; avoid fetching every old season.
+    premier_seasons = premier_seasons[:min(len(premier_seasons), max(2, int(acts) * 2))]
+
+    team_id = team.get("id") or team.get("team_id")
+    team_members_data = team.get("member") or team.get("members") or []
+    member_keys = set()
+    for player in team_members_data:
+        if player.get("puuid"):
+            member_keys.add(player["puuid"].lower())
+        if player.get("name"):
+            member_keys.add(f"{player['name']}#{player.get('tag', '')}".lower())
+
+    async def season_history(season):
+        cache_key = f"scout-history:{AFFINITY}:{team_name.casefold()}#{team_tag.casefold()}:{season['id']}"
+
+        async def fetch_history():
+            try:
+                data = await api(team_endpoint + "/history", season=season["id"])
+                return data.get("league_matches", []) if isinstance(data, dict) else data
+            except Exception as exc:
+                message = str(exc)
+                # Teams often have no index entry in older Premier seasons; cache that as an empty result.
+                if "404" in message and "Premier Team not found" in message:
+                    return []
+                print(f"Scout history lookup failed for season {season['id']}: {message}")
+                return []
+
+        return await cached(cache_key, 86400, fetch_history)
+
+    history_lists = await asyncio.gather(*(season_history(season) for season in premier_seasons))
+    act_windows = [(act["start"], act["end"]) for act in selected_acts]
+    match_records = {}
+    for season_matches in history_lists:
+        for match in season_matches if isinstance(season_matches, list) else []:
+            match_id = match.get("id") or match.get("match_id") or (match.get("meta") or {}).get("id")
+            if not match_id:
+                continue
+            started = parse_time(match.get("started_at") or (match.get("meta") or {}).get("started_at"))
+            if started:
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                if not any(start <= started <= end for start, end in act_windows):
+                    continue
+            match_records.setdefault(str(match_id), match)
+    matches = list(match_records.values())
+    if not matches:
+        act_names = ", ".join(act["name"] for act in selected_acts)
+        return await interaction.followup.send(
+            f"No Premier matches found for **{team_name}#{team_tag}** during {act_names}."
+        )
+
+    detail_gate = asyncio.Semaphore(1)
+
+    async def summarize_match(match):
+        match_id = match.get("id") or match.get("match_id") or (match.get("meta") or {}).get("id")
+        if not match_id:
+            return None
+        try:
+            cache_key = f"scoutmatch:{match_id}"
+            hit = _cache.get(cache_key)
+            is_fresh = hit and (hit.get("ttl") is None or time.time() - hit["t"] < hit["ttl"])
+            if is_fresh:
+                detail = await cached(cache_key, None, lambda: match_detail(match_id))
+            else:
+                async with detail_gate:
+                    await asyncio.sleep(1.25)
+                    # Completed match details are immutable, so keep them in the disk cache.
+                    detail = await cached(cache_key, None, lambda: match_detail(match_id))
+            summary = summarise(detail, member_keys, team_id, team_name, team_tag)
+            if not summary["rows"]:
+                return None
+            started = parse_time(summary.get("started"))
+            if not started:
+                return None
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if not any(start <= started <= end for start, end in act_windows):
+                return None
+            return summary
+        except Exception as exc:
+            print(f"Scout match {match_id} failed: {exc}")
+            return None
+
+    summaries = await asyncio.gather(*(summarize_match(match) for match in matches))
+    summaries = [item for item in summaries if item]
+    if not summaries:
+        return await interaction.followup.send(
+            f"Found **{team_name}#{team_tag}**, but couldn't match its Premier history to detailed match data in the selected acts."
+        )
+
+    maps = {}
+    wins = 0
+    for summary in summaries:
+        won = summary["won"]
+        wins += int(won)
+        record = maps.setdefault(summary["map"], {"wins": 0, "losses": 0, "agents": {}})
+        record["wins" if won else "losses"] += 1
+        for row in summary["rows"]:
+            agent = row.get("agent") or "Unknown"
+            if agent != "?":
+                record["agents"][agent] = record["agents"].get(agent, 0) + 1
+
+    total = len(summaries)
+    act_names = ", ".join(act["name"] for act in selected_acts)
+    embed = discord.Embed(
+        title=f"Premier scout · {team_name}#{team_tag}",
+        description=(f"**Record:** {wins}W–{total - wins}L · **Win rate:** {wins / total:.0%}\n"
+                     f"Based on {total} detailed matches across {len(selected_acts)} VALORANT act(s): {act_names}."),
+        colour=0xFF4655,
+    )
+    for map_name, record in sorted(maps.items(), key=lambda item: item[0].casefold()):
+        picks = sorted(record["agents"].items(), key=lambda item: (-item[1], item[0].casefold()))
+        pick_text = ", ".join(f"{agent} ×{count}" for agent, count in picks) or "No agent data"
+        embed.add_field(
+            name=f"{map_name} · {record['wins']}W–{record['losses']}L",
+            value=f"Agent picks: {pick_text}"[:1024],
+            inline=False,
+        )
+    embed.set_footer(text="Agent pick counts are pooled across players and matches on each map.")
+    await interaction.followup.send(embed=embed)
 
 
 FALLBACK_AGENTS = [
@@ -1070,34 +1532,109 @@ async def agent_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
-@tree.command(name="lineup", description="See who is playing which agent on a map")
+def draw_lineup_card(map_name, week_label, slots, agent_icons):
+    width, header, row_height = 900, 156, 112
+    rows = max(5, len(slots))
+    height = header + rows * row_height + 24
+    image = Image.new("RGB", (width, height), (15, 25, 35))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, 0, width, 7], fill=(255, 70, 85))
+    draw.text((32, 48), map_name, font=font(34, True), fill=WHITE, anchor="lm")
+    draw.text((34, 94), week_label or "Premier lineup", font=font(17), fill=GREY, anchor="lm")
+    picked = sum(1 for slot in slots if slot.get("agent"))
+    draw.text((width - 32, 70), f"{picked}/5 PICKS", font=font(20, True), fill=WHITE, anchor="rm")
+
+    for index in range(rows):
+        y = header + index * row_height
+        slot = slots[index] if index < len(slots) else {}
+        if index % 2 == 0:
+            draw.rounded_rectangle([20, y + 5, width - 20, y + row_height - 5], radius=12, fill=(20, 32, 45))
+        agent = slot.get("agent")
+        icon = agent_icons.get(agent.casefold()) if agent else None
+        if icon:
+            image.paste(icon, (42, y + 20), icon)
+        else:
+            draw.rounded_rectangle([42, y + 20, 114, y + 92], radius=12, fill=(39, 53, 69))
+            label = agent[:2].upper() if agent else "—"
+            draw.text((78, y + 56), label, font=font(18, True), fill=WHITE, anchor="mm")
+        player_name = slot.get("player") or "Open slot"
+        draw.text((142, y + 43), player_name[:34], font=font(21, True), fill=WHITE, anchor="lm")
+        subtext = slot.get("riot") or (agent if agent else "Waiting for an agent pick")
+        draw.text((142, y + 77), subtext[:44], font=font(15), fill=GREY, anchor="lm")
+    return image
+
+
+async def lineup_card_file(map_name, week_label, slots):
+    agent_icons = {}
+    try:
+        catalog = await icon_maps()
+        uuid_by_name = {name.casefold(): uuid for uuid, name in catalog.get("agent_names", {}).items()}
+        icon_jobs = {}
+        for slot in slots:
+            agent = slot.get("agent")
+            if not agent:
+                continue
+            agent_uuid = uuid_by_name.get(agent.casefold())
+            url = catalog.get("agents", {}).get(agent_uuid) if agent_uuid else None
+            if url and agent.casefold() not in icon_jobs:
+                icon_jobs[agent.casefold()] = icon_img(url, 72)
+        loaded_icons = await asyncio.gather(*icon_jobs.values()) if icon_jobs else []
+        agent_icons = dict(zip(icon_jobs.keys(), loaded_icons))
+    except Exception as exc:
+        print(f"Lineup agent icons unavailable: {exc}")
+
+    loop = asyncio.get_running_loop()
+    card = await loop.run_in_executor(None, draw_lineup_card, map_name, week_label, slots, agent_icons)
+    buffer = io.BytesIO()
+    card.save(buffer, "PNG")
+    buffer.seek(0)
+    return discord.File(buffer, filename="lineup.png")
+
+
+@tree.command(name="lineup", description="See the team lineup and agent icons for a map")
 @app_commands.describe(map_name="Map (default: the current or next map)")
 async def lineup(interaction: discord.Interaction, map_name: str = ""):
     picked_map = resolve_map(map_name)
     if not picked_map:
         return await interaction.response.send_message(NO_MAP, ephemeral=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+
     agent_data = load_agents()
     picks = agent_data.get(matching_map_key(agent_data, picked_map), {})
-    embed = discord.Embed(title=f"Lineup: {picked_map}", colour=0xFF4655)
-    season = load_season()
-    week = next((w for w in season["weeks"] if w["map"] == picked_map), None) if season else None
-    if week:
-        embed.description = f"{week['label']} ({fmt_range(week['start'], week['end'])})\n\n"
-    else:
-        embed.description = ""
-    if not picks:
-        embed.description += "Nobody has picked an agent yet. Use /agent."
-    else:
-        accounts = load_accounts()
-        lines = []
-        for uid, agent in picks.items():
-            acc = accounts.get(uid)
-            riot = f" ({acc['name']}#{acc['tag']})" if acc else ""
-            lines.append(f"<@{uid}>{riot} \u2192 **{agent}**")
-        embed.description += "\n".join(lines)
-        embed.set_footer(text=f"{len(picks)}/5 picked")
-    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    week = next((w for w in (load_season() or {}).get("weeks", []) if w["map"].casefold() == picked_map.casefold()), None)
+    week_label = f"{week['label']} · {fmt_range(week['start'], week['end'])}" if week else "Premier lineup"
+    slots = []
+    lines = []
+    for uid, agent in sorted(picks.items(), key=lambda item: str(item[0])):
+        try:
+            numeric_uid = int(uid)
+        except (TypeError, ValueError):
+            continue
+        player_name = await discord_display_name(interaction.guild, numeric_uid)
+        slots.append({"player": player_name, "agent": agent, "riot": ""})
+        lines.append(f"<@{uid}> · **{agent}**")
+    picked_count = len(slots)
+    while len(slots) < 5:
+        slots.append({"player": "Open slot", "agent": None, "riot": "Waiting for an agent pick"})
+    if not lines:
+        lines = ["No agent picks yet. Use /agent to claim a pick."]
+    elif picked_count < 5:
+        lines.append(f"**{5 - picked_count} pick(s) still open** · use /agent to fill them.")
 
+    lineup_file = await lineup_card_file(picked_map, week_label, slots)
+    embed = discord.Embed(
+        title=f"Lineup · {picked_map}",
+        description=f"{week_label}\n\n" + "\n".join(lines),
+        colour=0xFF4655,
+    )
+    embed.set_image(url="attachment://lineup.png")
+    embed.set_footer(text=f"{picked_count}/5 agent picks · Use /agent to pick or change your agent")
+    await interaction.followup.send(
+        embed=embed,
+        file=lineup_file,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 def load_playbooks():
@@ -1177,9 +1714,9 @@ for _cmd in (agent_cmd, assignagent, lineup, clearagent):
 
 
 HELP_SECTIONS = [
-    ("Premier", ["schedule", "results", "mapresults", "agent", "lineup", "clearagent", "playbook"]),
+    ("Premier", ["schedule", "results", "mapresults", "scout", "agent", "lineup", "clearagent", "playbook"]),
     ("Players", ["register", "unregister", "accounts", "rank", "player"]),
-    ("Server managers", ["assignagent", "createplaybook", "setschedule", "clearcache"]),
+    ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "clearcache"]),
     ("Troubleshooting", ["findteam", "debug"]),
 ]
 
