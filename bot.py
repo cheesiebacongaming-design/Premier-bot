@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,7 @@ SEASON_FILE = Path("season.json")  # edit this each act
 PLAYBOOK_FILE = Path("playbooks.json")
 ACCOUNTS_FILE = Path("accounts.json")  # Discord user -> Riot ID
 AGENTS_FILE = Path("agents.json")  # map -> {Discord user -> agent}
+PLAY_SESSIONS_FILE = Path("play_sessions.json")
 ICON_DIR = Path("icons")
 ICON_DIR.mkdir(exist_ok=True)
 
@@ -49,6 +51,7 @@ class BotClient(discord.Client):
         self.http_session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300))
         self.x_session = aiohttp.ClientSession(timeout=timeout)
         self.queue_reminder_task = asyncio.create_task(queue_reminder_loop())
+        self.play_session_task = asyncio.create_task(play_session_loop())
 
     async def close(self):
         for session in (getattr(self, "http_session", None), getattr(self, "x_session", None)):
@@ -1020,6 +1023,169 @@ def save_accounts(accounts):
     ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=1))
 
 
+def load_play_sessions():
+    try:
+        return json.loads(PLAY_SESSIONS_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_play_sessions(sessions):
+    PLAY_SESSIONS_FILE.write_text(json.dumps(sessions, indent=1))
+
+
+@tree.command(name="play", description="Start or stop tracking a Valorant queue session")
+@app_commands.describe(action="Start tracking or stop your active session", players="Optional queued players, as @mentions")
+@app_commands.choices(action=[app_commands.Choice(name="Start", value="start"), app_commands.Choice(name="Stop", value="stop")])
+async def play_cmd(interaction: discord.Interaction, action: app_commands.Choice[str], players: str = ""):
+    key = str(interaction.channel_id)
+    sessions = load_play_sessions()
+    if action.value == "stop":
+        existing = sessions.get(key)
+        if not existing:
+            return await interaction.response.send_message("There is no active play session in this channel.", ephemeral=True)
+        sessions.pop(key, None)
+        save_play_sessions(sessions)
+        return await interaction.response.send_message("Play session stopped.")
+
+    accounts = load_accounts()
+    ids = [str(interaction.user.id)]
+    ids.extend(re.findall(r"<@!?(\d+)>|\b(\d{15,20})\b", players))
+    ids = list(dict.fromkeys(uid for item in ids for uid in (item if isinstance(item, tuple) else (item,)) if uid))
+    missing = [uid for uid in ids if uid not in accounts]
+    if missing:
+        mentions = ", ".join(f"<@{uid}>" for uid in missing)
+        return await interaction.response.send_message(f"Link an account with /register first for: {mentions}", ephemeral=True,
+                                                       allowed_mentions=discord.AllowedMentions.none())
+    sessions[key] = {"channel_id": interaction.channel_id, "guild_id": interaction.guild_id,
+                     "owner_id": interaction.user.id, "players": ids, "seen": [],
+                     "started_at": datetime.now(timezone.utc).isoformat()}
+    save_play_sessions(sessions)
+    tags = " ".join(f"<@{uid}>" for uid in ids)
+    await interaction.response.send_message(f"Play session started for {tags}. I’ll check for completed competitive matches every 5 minutes.",
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+
+async def play_session_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        sessions = load_play_sessions()
+        accounts = load_accounts()
+        dirty = False
+        for key, session in list(sessions.items()):
+            try:
+                candidates = {}
+                for uid in session.get("players", []):
+                    account = accounts.get(str(uid))
+                    if not account:
+                        continue
+                    region = account.get("region") or AFFINITY
+                    data = await cached_api(f"/valorant/v1/stored-matches/{region}/{quote(account['name'])}/{quote(account['tag'])}",
+                                            240, mode="competitive", size=10)
+                    for item in data or []:
+                        mid = (item.get("meta") or {}).get("id")
+                        if mid:
+                            candidates[mid] = item
+                seen = set(session.get("seen", []))
+                fresh = []
+                for mid, item in candidates.items():
+                    if mid in seen:
+                        continue
+                    started = parse_time((item.get("meta") or {}).get("started_at"))
+                    since = parse_time(session.get("started_at"))
+                    seen.add(mid)
+                    if started and since and started >= since:
+                        fresh.append((mid, started))
+                session["seen"] = list(seen)[-100:]
+                session["started_at"] = session.get("started_at") or datetime.now(timezone.utc).isoformat()
+                dirty = True
+                channel = client.get_channel(int(session["channel_id"])) or await client.fetch_channel(int(session["channel_id"]))
+                for mid, _ in sorted(fresh, key=lambda pair: pair[1]):
+                    detail = await cached(f"playscoutmatch:{mid}", None, lambda mid=mid: match_detail(mid))
+                    queue_ids = set(session.get("players", []))
+                    participants = detail.get("players", [])
+                    # Only announce matches where at least one tracked account played.
+                    acc_names = {f"{accounts[uid]['name']}#{accounts[uid]['tag']}".casefold() for uid in queue_ids if uid in accounts}
+                    ours = [p for p in participants if f"{p.get('name','')}#{p.get('tag','')}".casefold() in acc_names]
+                    if not ours:
+                        continue
+                    team = ours[0].get("team_id")
+                    teammates = [p for p in participants if p.get("team_id") == team]
+                    embed, map_file = await play_match_embed(detail, teammates, ours[0])
+                    await channel.send(embed=embed, file=map_file if map_file else discord.utils.MISSING)
+            except Exception as exc:
+                print(f"Play session poll failed for channel {key}: {exc}")
+        if dirty:
+            save_play_sessions(sessions)
+        await asyncio.sleep(300)
+
+
+async def play_match_embed(detail, queued_players, representative):
+    meta = detail.get("metadata", {})
+    teams = {t.get("team_id"): t for t in detail.get("teams", [])}
+    team = teams.get(representative.get("team_id"), {})
+    enemy = next((t for tid, t in teams.items() if tid != representative.get("team_id")), {})
+    won = bool(team.get("won"))
+    score = f"{(team.get('rounds') or {}).get('won', 0)}-{(team.get('rounds') or {}).get('lost', 0)}"
+    map_data = meta.get("map") or {}
+    map_name = map_data.get("name", "Unknown")
+    started = parse_time(meta.get("started_at"))
+    duration_ms = meta.get("game_length_in_ms") or 0
+    duration = f"{duration_ms // 60000} min" if duration_ms else "Competitive"
+    embed = discord.Embed(title=f"{map_name} · {'Victory' if won else 'Defeat'} {score}",
+                          description=f"Competitive · {duration} · {ts(started, 'R')}", colour=0x2ECC71 if won else 0xE74C3C)
+    # Keep the queued players together and include tracker-like highlights.
+    kills_by_id = {}
+    half_stats = {}
+    for kill in detail.get("kills") or []:
+        killer = (kill.get("killer") or {}).get("puuid")
+        victim = (kill.get("victim") or {}).get("puuid")
+        half = 0 if (kill.get("round", 0) or 0) <= 12 else 1
+        if killer:
+            kills_by_id[killer] = kills_by_id.get(killer, 0) + 1
+            half_stats.setdefault(killer, [[0, 0], [0, 0]])[half][0] += 1
+        if victim:
+            half_stats.setdefault(victim, [[0, 0], [0, 0]])[half][1] += 1
+    for p in queued_players:
+        st = p.get("stats", {})
+        rounds = max(sum((t.get("rounds") or {}).get(k, 0) for k in ("won", "lost")) for t in teams.values()) if teams else 1, 1)
+        shots = st.get("headshots", 0) + st.get("bodyshots", 0) + st.get("legshots", 0)
+        hs = round(st.get("headshots", 0) * 100 / shots) if shots else 0
+        tags = []
+        if st.get("kills", 0) >= 4: tags.append("QUAD" if st["kills"] == 4 else "ACE")
+        if st.get("kills", 0) == max((x.get("stats", {}).get("kills", 0) for x in queued_players), default=0): tags.append("MVP")
+        if kills_by_id.get(p.get("puuid"), 0) >= 3: tags.append("FIRST BLOOD")
+        if st.get("deaths", 0) >= 18: tags.append("VICTIM")
+        label = f"{p.get('name','?')}#{p.get('tag','')} · {p.get('agent',{}).get('name','?')}"
+        halves = half_stats.get(p.get("puuid"), [[0, 0], [0, 0]])
+        stats = (f"{' · '.join(tags) if tags else '—'}\nKDA **{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}** · "
+                 f"ACS **{round(st.get('score',0)/rounds)}** · KD **{st.get('kills',0)/max(st.get('deaths',0),1):.2f}**\n"
+                 f"HS {hs}% · H1 {halves[0][0]}/{halves[0][1]} · H2 {halves[1][0]}/{halves[1][1]}")
+        embed.add_field(name=label[:256], value=stats, inline=True)
+    embed.add_field(name="Match breakdown", value=f"{(team.get('premier_roster') or {}).get('name') or 'Your team'} **{score}** {(enemy.get('premier_roster') or {}).get('name') or 'Opponents'}", inline=False)
+    map_uuid = map_data.get("id") or map_data.get("uuid")
+    map_file = None
+    if map_uuid:
+        embed.add_field(name="Map", value=f"[{map_name}](https://valorant-api.com/v1/maps/{map_uuid})", inline=True)
+        path = ICON_DIR / f"map_{map_uuid}.jpg"
+        try:
+            if not path.exists():
+                async with client.http_session.get(f"https://valorant-api.com/v1/maps/{map_uuid}") as response:
+                    response.raise_for_status()
+                    map_info = (await response.json()).get("data", {})
+                image_url = map_info.get("splash") or map_info.get("listViewIcon")
+                if image_url:
+                    async with client.http_session.get(image_url) as response:
+                        response.raise_for_status()
+                        path.write_bytes(await response.read())
+            if path.exists():
+                map_file = discord.File(path, filename="map.jpg")
+                embed.set_image(url="attachment://map.jpg")
+        except Exception as exc:
+            print(f"Map art unavailable for {map_name}: {exc}")
+    return embed, map_file
+
+
 def split_riot_id(text):
     name, sep, tag = (text or "").strip().rpartition("#")
     return (name.strip(), tag.strip()) if sep and name.strip() and tag.strip() else None
@@ -1715,7 +1881,7 @@ for _cmd in (agent_cmd, assignagent, lineup, clearagent):
 
 HELP_SECTIONS = [
     ("Premier", ["schedule", "results", "mapresults", "scout", "agent", "lineup", "clearagent", "playbook"]),
-    ("Players", ["register", "unregister", "accounts", "rank", "player"]),
+    ("Players", ["register", "unregister", "accounts", "rank", "player", "play"]),
     ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "clearcache"]),
     ("Troubleshooting", ["findteam", "debug"]),
 ]
