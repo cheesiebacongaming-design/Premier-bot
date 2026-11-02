@@ -429,11 +429,17 @@ def draw_soft_box(image, box, fill, opacity=224, radius=4):
     """Draw a lightly transparent, compact chip on an existing RGB image."""
     left, top, right, bottom = box
     width, height = right - left, bottom - top
-    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    scale = 4
+    layer = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
     ImageDraw.Draw(layer).rounded_rectangle(
-        (0, 0, width - 1, height - 1), radius=radius, fill=(*fill, opacity)
+        (0, 0, width * scale - 1, height * scale - 1),
+        radius=radius * scale,
+        fill=(*fill, opacity),
     )
-    image.paste(layer, (left, top), layer)
+    layer = layer.resize((width, height), Image.Resampling.LANCZOS)
+    base = image.crop((left, top, right, bottom)).convert("RGBA")
+    base.alpha_composite(layer)
+    image.paste(base.convert("RGB"), (left, top))
 
 
 async def icon_maps():
@@ -1175,9 +1181,7 @@ async def play_session_loop():
                         continue
                     team = ours[0].get("team_id")
                     teammates = [p for p in participants if p.get("team_id") == team]
-                    queued = [p for p in teammates
-                              if f"{p.get('name','')}#{p.get('tag','')}".casefold() in acc_names]
-                    card = await play_match_image(detail, queued, queued, ours[0])
+                    card = await play_match_image(detail, teammates, teammates, ours[0])
                     await channel.send(file=card, allowed_mentions=discord.AllowedMentions.none())
             except Exception as exc:
                 print(f"Play session poll failed for channel {key}: {exc}")
@@ -1693,24 +1697,7 @@ async def recent_cmd(interaction: discord.Interaction, player: discord.Member = 
             return await interaction.followup.send("I found the match, but couldn't match the linked account to its scoreboard.")
         team_id = target_player.get("team_id")
         teammates = [p for p in participants if p.get("team_id") == team_id]
-        target_id = str(target.id)
-        sessions = load_play_sessions()
-        session = sessions.get(str(interaction.channel_id))
-        if not session or target_id not in {str(uid) for uid in session.get("players", [])}:
-            session = next((candidate for candidate in sessions.values()
-                            if str(candidate.get("guild_id")) == str(interaction.guild_id)
-                            and target_id in {str(uid) for uid in candidate.get("players", [])}), None)
-        queued_names = {f"{account['name']}#{account['tag']}".casefold()}
-        if session:
-            linked_accounts = load_accounts()
-            queued_names.update(
-                f"{linked_accounts[str(uid)]['name']}#{linked_accounts[str(uid)]['tag']}".casefold()
-                for uid in session.get("players", []) if str(uid) in linked_accounts
-            )
-        queued = [p for p in teammates if f"{p.get('name', '')}#{p.get('tag', '')}".casefold() in queued_names]
-        if all(p.get("puuid") != target_player.get("puuid") for p in queued):
-            queued.insert(0, target_player)
-        card = await play_match_image(detail, queued, queued, target_player)
+        card = await play_match_image(detail, teammates, teammates, target_player)
         await interaction.followup.send(file=card, allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         await interaction.followup.send(f"Couldn't load the recent match: {str(exc)[:300]}")
