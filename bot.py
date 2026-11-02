@@ -1262,20 +1262,24 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             bg = bg.resize((int(bg.width * ratio), int(bg.height * ratio)))
             left, top = (bg.width - width) // 2, (bg.height - hero_h) // 2
             bg = bg.crop((left, top, left + width, top + hero_h))
-            bg = Image.blend(bg, Image.new("RGB", bg.size, (8, 10, 15)), 0.56)
+            bg = Image.blend(bg, Image.new("RGB", bg.size, (8, 9, 12)), 0.60)
             image.paste(bg, (0, 0))
         except Exception:
             pass
     draw.rectangle((0, hero_h, width, height), fill=(17, 17, 22))
-    accent = (76, 190, 112) if won else (224, 92, 99)
-    f_title, f_sub, f_name, f_stat, f_small = font(42, True), font(20), font(24, True), font(23, True), font(16)
-    draw.text((38, 155), map_name.upper(), font=font(54, True), fill=(248, 248, 250), anchor="lm")
+    accent = (72, 181, 105) if won else (220, 86, 94)
+    f_sub = font(20)
+    draw.text((38, 155), map_name.upper(), font=font(58, True), fill=(250, 250, 252), anchor="lm",
+              stroke_width=3, stroke_fill=(250, 250, 252))
     date_label = started.astimezone(timezone.utc).strftime("%b %d, %Y, %I:%M %p") if started else "Time unavailable"
-    draw.text((40, 209), f"Competitive | {duration} | {date_label}", font=f_sub, fill=(205, 207, 214), anchor="lm")
+    draw.text((40, 209), f"Competitive · {duration} · {date_label}", font=f_sub, fill=(210, 208, 212), anchor="lm")
     badge = f"{'Victory' if won else 'Defeat'} {our_score}-{their_score}"
-    draw.rounded_rectangle((width - 255, 174, width - 34, 226), radius=24, fill=accent)
-    draw.text((width - 144, 200), badge, font=font(22, True), fill=WHITE, anchor="mm")
-    draw.text((32, hero_h + 44), headline, font=font(32, True), fill=(240, 105, 112), anchor="lm")
+    draw.rounded_rectangle((width - 255, 174, width - 34, 226), radius=18, fill=accent)
+    draw.text((width - 144, 200), badge, font=font(23, True), fill=(255, 250, 250), anchor="mm",
+              stroke_width=1, stroke_fill=(255, 250, 250))
+    coral = (240, 99, 106)
+    draw.text((32, hero_h + 44), headline, font=font(35, True), fill=coral, anchor="lm",
+              stroke_width=2, stroke_fill=coral)
     for line_index, line in enumerate(recap_lines):
         draw.text((32, hero_h + 100 + line_index * 39), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
     for index, item in enumerate(tracked):
@@ -1286,7 +1290,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             x = side_pad + col * (card_width + column_gap)
         y = cards_top + row * (card_h + gap)
         right = x + card_width
-        draw.rounded_rectangle((x, y, right, y + card_h), radius=20, fill=(29, 28, 34), outline=(39, 38, 45), width=2)
+        draw.rounded_rectangle((x, y, right, y + card_h), radius=14, fill=(29, 28, 32), outline=(48, 46, 51), width=1)
         p, st = item["p"], item["st"]
         agent_obj = p.get("agent") or p.get("character") or {}
         agent = (agent_obj.get("name") or agent_obj.get("display_name") or agent_obj.get("displayName") or "Agent") if isinstance(agent_obj, dict) else str(agent_obj)
@@ -1304,10 +1308,12 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         while player_name_size > 18 and draw.textlength(player_name, font=player_name_font) > right - x - 132:
             player_name_size -= 1
             player_name_font = font(player_name_size, True)
-        draw.text((x + 108, y + 43), player_name, font=player_name_font, fill=(157, 191, 255), anchor="lm")
-        draw.text((x + 108, y + 75), agent, font=font(17), fill=GREY, anchor="lm")
+        player_blue = (164, 194, 245)
+        draw.text((x + 108, y + 43), player_name, font=player_name_font, fill=player_blue, anchor="lm",
+                  stroke_width=1, stroke_fill=player_blue)
+        draw.text((x + 108, y + 75), agent, font=font(17), fill=(166, 164, 172), anchor="lm")
         tx, tag_row = x + 22, 0
-        tag_font = font(14, True)
+        tag_font = font(15, True)
         for tag in item["tags"]:
             tw = int(draw.textlength(tag, font=tag_font)) + 22
             max_right = right - 20
@@ -1317,20 +1323,23 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             tag_key = tag.split(" x", 1)[0]
             tag_colour, tag_text = PLAY_TAG_STYLES.get(tag_key, ((68, 68, 78), (235, 235, 240)))
             tag_y = y + 110 + tag_row * 38
-            draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 32), radius=7, fill=tag_colour)
+            draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 32), radius=6, fill=tag_colour)
             draw.text((tx + tw / 2, tag_y + 16), tag, font=tag_font, fill=tag_text, anchor="mm")
             tx += tw + 9
+        stat_label_y = y + (156 + tag_row * 36 if item["tags"] else 126)
+        stat_value_y = stat_label_y + 31
         labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
                   ("ACS", str(round(st.get("score", 0) / round_count))),
                   ("KD", f"{st.get('kills',0) / max(st.get('deaths',0),1):.2f}")]
         cell_w = (right - x - 44) // 3
         for cell, (label, value) in enumerate(labels):
             cx = x + 22 + cell * cell_w + cell_w // 2
-            draw.text((cx, y + 204), label, font=font(16), fill=(136, 138, 149), anchor="mm")
-            draw.text((cx, y + 235), value, font=font(25, True), fill=WHITE, anchor="mm")
+            draw.text((cx, stat_label_y), label, font=font(16, True), fill=(166, 163, 171), anchor="mm")
+            draw.text((cx, stat_value_y), value, font=font(26, True), fill=(247, 246, 248), anchor="mm",
+                      stroke_width=1, stroke_fill=(247, 246, 248))
         draw.text(((x + right) // 2, y + 278),
                   f"HS {item['hs']}% | H1 {item['h1']} | H2 {item['h2']} | FB {item['fb']} | FD {item['fd']}",
-                  font=font(16), fill=(145, 147, 158), anchor="mm")
+                  font=font(16), fill=(164, 162, 170), anchor="mm")
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     buffer.seek(0)
