@@ -410,6 +410,21 @@ def font(size, bold=False, serif=False):
         return ImageFont.load_default()
 
 
+MATCH_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+
+
+def match_font(size, bold=False, serif=False):
+    """Use bundled match-card fonts so Windows and Linux produce the same image."""
+    name = ("Lora-Bold.ttf" if bold else "Lora-Regular.ttf") if serif else (
+        "Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"
+    )
+    path = MATCH_FONT_DIR / name
+    try:
+        return ImageFont.truetype(str(path), size)
+    except OSError:
+        return font(size, bold=bold, serif=serif)
+
+
 async def icon_maps():
     """Agent image URLs and rank tier icons from valorant-api.com, cached a week."""
 
@@ -424,10 +439,10 @@ async def icon_maps():
         )
         agents, tiers = agents_data["data"], tiers_data["data"]
         return {
-            "agents": {a["uuid"].lower(): (a.get("displayIcon") or a.get("killfeedPortrait") or a.get("bustPortrait") or a.get("fullPortrait")) for a in agents},
+            "agents": {a["uuid"].lower(): (a.get("killfeedPortrait") or a.get("bustPortrait") or a.get("displayIcon") or a.get("fullPortrait")) for a in agents},
             "agent_icon_urls": {
                 a["uuid"].lower(): list(dict.fromkeys(
-                    url for url in (a.get("displayIcon"), a.get("bustPortrait"), a.get("fullPortrait"), a.get("killfeedPortrait")) if url
+                    url for url in (a.get("killfeedPortrait"), a.get("bustPortrait"), a.get("displayIcon"), a.get("fullPortrait")) if url
                 )) for a in agents
             },
             "agent_names": {a["uuid"].lower(): a["displayName"] for a in agents},
@@ -435,7 +450,7 @@ async def icon_maps():
         }
 
     try:
-        return await cached("icons:maps3", 7 * 86400, fetch)
+        return await cached("icons:maps4", 7 * 86400, fetch)
     except Exception:
         # Continue using the repository's older cached image catalog if the asset host is down.
         return await cached("icons:maps2", None, fetch)
@@ -453,7 +468,11 @@ async def icon_img(url, size):
                     if r.status != 200:
                         return None
                     path.write_bytes(await r.read())
-        return Image.open(path).convert("RGBA").resize((size, size))
+        source = Image.open(path).convert("RGBA")
+        fitted = ImageOps.contain(source, (size, size), method=Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        canvas.alpha_composite(fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2))
+        return canvas
     except Exception:
         return None
 
@@ -1241,13 +1260,13 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
                         "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0),
                         "adr": damage_by_id.get(puuid, 0)})
 
-    width, hero_h, card_h, gap = 1200, 270, 300, 18
+    width, hero_h, card_h, gap = 1200, 270, 276, 18
     recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
     headline = _play_headline(all_teammates, our_score, their_score)
-    recap_font = font(23, serif=True)
+    recap_font = match_font(22, serif=True)
     measure_draw = ImageDraw.Draw(Image.new("RGB", (width, 1)))
     recap_lines = _wrap_image_text(measure_draw, recap, recap_font, width - 64, 7)
-    summary_h = 116 + max(0, len(recap_lines) - 1) * 39
+    summary_h = 152 + max(0, len(recap_lines) - 1) * 42
     columns, side_pad, column_gap = 2, 24, 18
     card_width = (width - 2 * side_pad - column_gap) // columns
     rows = max(1, (len(tracked) + columns - 1) // columns)
@@ -1268,20 +1287,28 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             pass
     draw.rectangle((0, hero_h, width, height), fill=(17, 17, 22))
     accent = (72, 181, 105) if won else (220, 86, 94)
-    f_sub = font(20)
-    draw.text((38, 155), map_name.upper(), font=font(58, True), fill=(250, 250, 252), anchor="lm",
-              stroke_width=3, stroke_fill=(250, 250, 252))
-    date_label = started.astimezone(timezone.utc).strftime("%b %d, %Y, %I:%M %p") if started else "Time unavailable"
-    draw.text((40, 209), f"Competitive · {duration} · {date_label}", font=f_sub, fill=(210, 208, 212), anchor="lm")
+    f_sub = match_font(19)
+    draw.text((8, 169), map_name.upper(), font=match_font(56, True), fill=(250, 250, 252), anchor="lm")
+    if started:
+        match_time = started.astimezone(timezone.utc)
+        date_label = f"{match_time.strftime('%b %d, %Y, ')}{match_time.strftime('%I').lstrip('0')}:{match_time.strftime('%M:%S %p')}"
+    else:
+        date_label = "Time unavailable"
+    draw.text((8, 224), f"Competitive · {duration} · {date_label}", font=f_sub, fill=(207, 205, 210), anchor="lm")
     badge = f"{'Victory' if won else 'Defeat'} {our_score}-{their_score}"
-    draw.rounded_rectangle((width - 255, 174, width - 34, 226), radius=18, fill=accent)
-    draw.text((width - 144, 200), badge, font=font(23, True), fill=(255, 250, 250), anchor="mm",
-              stroke_width=1, stroke_fill=(255, 250, 250))
+    badge_box = (width - 228, 186, width - 20, 238)
+    draw.rounded_rectangle(badge_box, radius=18, fill=accent)
+    draw.text(((badge_box[0] + badge_box[2]) // 2, (badge_box[1] + badge_box[3]) // 2), badge,
+              font=match_font(21, True), fill=(255, 250, 250), anchor="mm")
     coral = (240, 99, 106)
-    draw.text((32, hero_h + 44), headline, font=font(35, True), fill=coral, anchor="lm",
-              stroke_width=2, stroke_fill=coral)
+    headline_size = 32
+    headline_font = match_font(headline_size, True)
+    while headline_size > 22 and draw.textlength(headline, font=headline_font) > width - 64:
+        headline_size -= 1
+        headline_font = match_font(headline_size, True)
+    draw.text((12, hero_h + 44), headline, font=headline_font, fill=coral, anchor="lm")
     for line_index, line in enumerate(recap_lines):
-        draw.text((32, hero_h + 100 + line_index * 39), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
+        draw.text((32, hero_h + 100 + line_index * 42), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
     for index, item in enumerate(tracked):
         col, row = index % columns, index // columns
         if len(tracked) % columns and row == rows - 1:
@@ -1290,30 +1317,27 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             x = side_pad + col * (card_width + column_gap)
         y = cards_top + row * (card_h + gap)
         right = x + card_width
-        draw.rounded_rectangle((x, y, right, y + card_h), radius=14, fill=(29, 28, 32), outline=(48, 46, 51), width=1)
+        draw.rounded_rectangle((x, y, right, y + card_h), radius=14, fill=(28, 27, 31), outline=(42, 40, 45), width=1)
         p, st = item["p"], item["st"]
         agent_obj = p.get("agent") or p.get("character") or {}
         agent = (agent_obj.get("name") or agent_obj.get("display_name") or agent_obj.get("displayName") or "Agent") if isinstance(agent_obj, dict) else str(agent_obj)
         icon = p.get("_play_icon")
-        icon_box = (x + 22, y + 22, x + 92, y + 92)
-        draw.rounded_rectangle(icon_box, radius=12, fill=(48, 53, 68))
         if icon:
-            icon = ImageOps.contain(icon.convert("RGBA"), (66, 66), method=Image.Resampling.LANCZOS)
-            icon_x = x + 24 + (66 - icon.width) // 2
-            icon_y = y + 24 + (66 - icon.height) // 2
+            icon = ImageOps.contain(icon.convert("RGBA"), (54, 54), method=Image.Resampling.LANCZOS)
+            icon_x = x + 20 + (54 - icon.width) // 2
+            icon_y = y + 18 + (54 - icon.height) // 2
             image.paste(icon, (icon_x, icon_y), icon)
         player_name = str(p.get("name", "?"))
-        player_name_size = 28
-        player_name_font = font(player_name_size, True)
-        while player_name_size > 18 and draw.textlength(player_name, font=player_name_font) > right - x - 132:
+        player_name_size = 25
+        player_name_font = match_font(player_name_size, True)
+        while player_name_size > 18 and draw.textlength(player_name, font=player_name_font) > right - x - 112:
             player_name_size -= 1
-            player_name_font = font(player_name_size, True)
+            player_name_font = match_font(player_name_size, True)
         player_blue = (164, 194, 245)
-        draw.text((x + 108, y + 43), player_name, font=player_name_font, fill=player_blue, anchor="lm",
-                  stroke_width=1, stroke_fill=player_blue)
-        draw.text((x + 108, y + 75), agent, font=font(17), fill=(166, 164, 172), anchor="lm")
+        draw.text((x + 88, y + 42), player_name, font=player_name_font, fill=player_blue, anchor="lm")
+        draw.text((x + 88, y + 69), agent, font=match_font(16), fill=(164, 161, 168), anchor="lm")
         tx, tag_row = x + 22, 0
-        tag_font = font(15, True)
+        tag_font = match_font(14, True)
         for tag in item["tags"]:
             tw = int(draw.textlength(tag, font=tag_font)) + 22
             max_right = right - 20
@@ -1322,11 +1346,11 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
                 tx = x + 22
             tag_key = tag.split(" x", 1)[0]
             tag_colour, tag_text = PLAY_TAG_STYLES.get(tag_key, ((68, 68, 78), (235, 235, 240)))
-            tag_y = y + 110 + tag_row * 38
-            draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 32), radius=6, fill=tag_colour)
-            draw.text((tx + tw / 2, tag_y + 16), tag, font=tag_font, fill=tag_text, anchor="mm")
+            tag_y = y + 94 + tag_row * 34
+            draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 30), radius=6, fill=tag_colour)
+            draw.text((tx + tw / 2, tag_y + 15), tag, font=tag_font, fill=tag_text, anchor="mm")
             tx += tw + 9
-        stat_label_y = y + (156 + tag_row * 36 if item["tags"] else 126)
+        stat_label_y = y + 154 + tag_row * 32
         stat_value_y = stat_label_y + 31
         labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
                   ("ACS", str(round(st.get("score", 0) / round_count))),
@@ -1334,12 +1358,12 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         cell_w = (right - x - 44) // 3
         for cell, (label, value) in enumerate(labels):
             cx = x + 22 + cell * cell_w + cell_w // 2
-            draw.text((cx, stat_label_y), label, font=font(16, True), fill=(166, 163, 171), anchor="mm")
-            draw.text((cx, stat_value_y), value, font=font(26, True), fill=(247, 246, 248), anchor="mm",
-                      stroke_width=1, stroke_fill=(247, 246, 248))
-        draw.text(((x + right) // 2, y + 278),
+            draw.text((cx, stat_label_y), label, font=match_font(16), fill=(154, 151, 160), anchor="mm")
+            draw.text((cx, stat_value_y), value, font=match_font(24, True), fill=(247, 246, 248), anchor="mm")
+        subtext_y = y + 232 + tag_row * 28
+        draw.text(((x + right) // 2, subtext_y),
                   f"HS {item['hs']}% | H1 {item['h1']} | H2 {item['h2']} | FB {item['fb']} | FD {item['fd']}",
-                  font=font(16), fill=(164, 162, 170), anchor="mm")
+                  font=match_font(15), fill=(155, 152, 161), anchor="mm")
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     buffer.seek(0)
@@ -1535,7 +1559,11 @@ async def play_match_image(detail, queued_players, all_teammates, representative
         if agent_id not in catalog.get("agents", {}):
             agent_id = ids_by_name.get(agent_name.casefold(), agent_id)
         direct_icon_url = f"https://media.valorant-api.com/agents/{agent_id}/displayicon.png" if agent_id else None
-        icon_urls = ([direct_icon_url] if direct_icon_url else [])
+        icon_urls = ([
+            f"https://media.valorant-api.com/agents/{agent_id}/killfeedportrait.png",
+            f"https://media.valorant-api.com/agents/{agent_id}/bustportrait.png",
+            direct_icon_url,
+        ] if direct_icon_url else [])
         icon_urls.extend(catalog.get("agent_icon_urls", {}).get(agent_id) or [catalog.get("agents", {}).get(agent_id)])
         icon_urls = list(dict.fromkeys(url for url in icon_urls if url))
         puuid = player.get("puuid")
@@ -1543,7 +1571,7 @@ async def play_match_image(detail, queued_players, all_teammates, representative
             agent_names_by_puuid[puuid] = agent_name
             async def fetch_agent_icon(urls=icon_urls):
                 for url in urls:
-                    image = await icon_img(url, 66)
+                    image = await icon_img(url, 64)
                     if image is not None:
                         return image
                 return None
