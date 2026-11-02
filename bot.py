@@ -13,7 +13,7 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 import discord
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -1114,11 +1114,7 @@ async def play_session_loop():
                     queued = [p for p in teammates
                               if f"{p.get('name','')}#{p.get('tag','')}".casefold() in acc_names]
                     card = await play_match_image(detail, queued, teammates, ours[0])
-                    map_data = (detail.get("metadata", {}).get("map") or {})
-                    map_uuid = map_data.get("id") or map_data.get("uuid")
-                    map_link = f"https://valorant-api.com/v1/maps/{map_uuid}" if map_uuid else "https://playvalorant.com/"
-                    await channel.send(content=f"[Map: {map_data.get('name', 'Unknown')}]({map_link})",
-                                       file=card, allowed_mentions=discord.AllowedMentions.none())
+                    await channel.send(file=card, allowed_mentions=discord.AllowedMentions.none())
             except Exception as exc:
                 print(f"Play session poll failed for channel {key}: {exc}")
         if dirty:
@@ -1172,7 +1168,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         if best_round >= 5: tags.append("ACE")
         elif best_round == 4: tags.append("QUAD")
         if puuid == team_mvp_id: tags.append("MVP")
-        if first_bloods.get(puuid, 0): tags.append(f"FIRST BLOOD ×{first_bloods[puuid]}")
+        if first_bloods.get(puuid, 0): tags.append(f"FIRST BLOOD x{first_bloods[puuid]}")
         half_kills = [0, 0]
         half_deaths = [0, 0]
         for round_number, kill_map in kills_per_round.items():
@@ -1184,8 +1180,9 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         tracked.append({"p": p, "st": st, "hs": hs, "tags": tags,
                         "h1": f"{half_kills[0]}/{half_deaths[0]}", "h2": f"{half_kills[1]}/{half_deaths[1]}"})
 
-    width, header_h, card_h, gap = 1200, 300, 230, 18
-    columns = 2
+    width, header_h, card_h, gap = 1200, 330, 250, 18
+    columns, side_pad, column_gap = 2, 24, 18
+    card_width = (width - 2 * side_pad - column_gap) // columns
     rows = max(1, (len(tracked) + columns - 1) // columns)
     height = header_h + 64 + rows * (card_h + gap) + 100
     image = Image.new("RGB", (width, height), (17, 17, 22))
@@ -1205,28 +1202,40 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     accent = (82, 196, 120) if won else (220, 83, 91)
     f_title, f_sub, f_name, f_stat, f_small = font(42, True), font(20), font(24, True), font(23, True), font(16)
     draw.text((38, 150), map_name.upper(), font=f_title, fill=WHITE, anchor="lm")
-    date_label = started.astimezone(timezone.utc).strftime("%b %d, %Y · %H:%M UTC") if started else "Time unavailable"
-    draw.text((40, 198), f"COMPETITIVE · {duration} · {date_label}", font=f_sub, fill=(210, 214, 220), anchor="lm")
-    badge = f"{'VICTORY' if won else 'DEFEAT'}  {our_score}–{their_score}"
+    date_label = started.astimezone(timezone.utc).strftime("%b %d, %Y | %H:%M UTC") if started else "Time unavailable"
+    draw.text((40, 198), f"COMPETITIVE | {duration} | {date_label}", font=f_sub, fill=(210, 214, 220), anchor="lm")
+    badge = f"{'VICTORY' if won else 'DEFEAT'}  {our_score}-{their_score}"
     draw.rounded_rectangle((width - 340, 140, width - 38, 204), radius=25, fill=accent)
     draw.text((width - 189, 172), badge, font=font(23, True), fill=WHITE, anchor="mm")
+    recap = _play_recap(map_name, won, our_score, their_score, tracked)
+    recap_lines = _wrap_image_text(draw, recap, font(17), width - 80, 2)
+    for line_index, line in enumerate(recap_lines):
+        draw.text((40, 250 + line_index * 24), line, font=font(17), fill=(232, 234, 239), anchor="lm")
     for index, item in enumerate(tracked):
         col, row = index % columns, index // columns
-        x = 24 + col * (width // 2)
-        y = header_h + 24 + row * (card_h + gap)
-        right = x + width // 2 - 18
+        x = side_pad + col * (card_width + column_gap)
+        y = header_h + 20 + row * (card_h + gap)
+        right = x + card_width
         draw.rounded_rectangle((x, y, right, y + card_h), radius=18, fill=(30, 30, 37), outline=(50, 50, 60), width=2)
         p, st = item["p"], item["st"]
-        agent = (p.get("agent") or {}).get("name", "Agent")
-        draw.ellipse((x + 22, y + 24, x + 78, y + 80), fill=(65, 78, 102))
-        draw.text((x + 50, y + 52), agent[:2].upper(), font=font(18, True), fill=WHITE, anchor="mm")
+        agent_obj = p.get("agent") or p.get("character") or {}
+        agent = agent_obj.get("name", "Agent") if isinstance(agent_obj, dict) else str(agent_obj)
+        icon = item.get("_play_icon")
+        icon_box = (x + 22, y + 20, x + 86, y + 84)
+        draw.rounded_rectangle(icon_box, radius=12, fill=(48, 53, 68))
+        if icon:
+            icon = ImageOps.fit(icon.convert("RGBA"), (60, 60), method=Image.Resampling.LANCZOS)
+            image.paste(icon, (x + 24, y + 22), icon)
         draw.text((x + 94, y + 42), f"{p.get('name', '?')}#{p.get('tag', '')}", font=f_name, fill=(145, 190, 255), anchor="lm")
-        draw.text((x + 95, y + 72), agent, font=f_small, fill=GREY, anchor="lm")
+        draw.text(((x + right) // 2, y + 93), agent, font=f_small, fill=GREY, anchor="mm")
         tx = x + 22
         for tag in item["tags"]:
             tw = int(draw.textlength(tag, font=font(14, True))) + 24
-            draw.rounded_rectangle((tx, y + 98, tx + tw, y + 130), radius=7, fill=(116, 85, 42) if tag == "MVP" else (57, 94, 126) if "FIRST" in tag else (130, 91, 34))
-            draw.text((tx + tw / 2, y + 114), tag, font=font(14, True), fill=(255, 225, 157), anchor="mm")
+            max_right = right - 20
+            if tx + tw > max_right:
+                tx = x + 22
+            draw.rounded_rectangle((tx, y + 112, tx + tw, y + 144), radius=7, fill=(116, 85, 42) if tag == "MVP" else (57, 94, 126) if "FIRST" in tag else (130, 91, 34))
+            draw.text((tx + tw / 2, y + 128), tag, font=font(14, True), fill=(255, 225, 157), anchor="mm")
             tx += tw + 9
         labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
                   ("ACS", str(round(st.get("score", 0) / round_count))),
@@ -1234,18 +1243,59 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         cell_w = (right - x - 44) // 3
         for cell, (label, value) in enumerate(labels):
             cx = x + 22 + cell * cell_w + cell_w // 2
-            draw.text((cx, y + 159), label, font=f_small, fill=GREY, anchor="mm")
-            draw.text((cx, y + 190), value, font=f_stat, fill=WHITE, anchor="mm")
-        draw.text((right - 20, y + 216), f"HS {item['hs']}%  ·  H1 {item['h1']}  ·  H2 {item['h2']}", font=f_small, fill=(155, 158, 169), anchor="rs")
-    breakdown_y = header_h + 32 + rows * (card_h + gap)
+            draw.text((cx, y + 177), label, font=f_small, fill=GREY, anchor="mm")
+            draw.text((cx, y + 207), value, font=f_stat, fill=WHITE, anchor="mm")
+        draw.text(((x + right) // 2, y + 235), f"HS {item['hs']}%  |  H1 {item['h1']}  |  H2 {item['h2']}", font=f_small, fill=(155, 158, 169), anchor="mm")
+    breakdown_y = header_h + 28 + rows * (card_h + gap)
     our_team_name = (team.get("premier_roster") or {}).get("name") or "Your team"
     enemy_name = (enemy.get("premier_roster") or {}).get("name") or "Opponents"
     draw.rounded_rectangle((24, breakdown_y, width - 24, breakdown_y + 72), radius=14, fill=(27, 27, 34))
-    draw.text((48, breakdown_y + 36), f"MATCH BREAKDOWN   ⚔   {our_team_name}  {our_score}  –  {their_score}  {enemy_name}", font=f_sub, fill=WHITE, anchor="lm")
+    draw.text((48, breakdown_y + 36), f"MATCH BREAKDOWN   |   {our_team_name}  {our_score} - {their_score}  {enemy_name}", font=f_sub, fill=WHITE, anchor="lm")
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     buffer.seek(0)
     return buffer
+
+
+def _wrap_image_text(draw, text, image_font, max_width, max_lines=2):
+    words, lines, current, truncated = text.split(), [], "", False
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and draw.textlength(candidate, font=image_font) > max_width:
+            lines.append(current)
+            current = word
+            if len(lines) == max_lines:
+                truncated = True
+                break
+        else:
+            current = candidate
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    if truncated and lines:
+        lines[-1] = lines[-1].rstrip(" .") + "..."
+    return lines
+
+
+def _play_recap(map_name, won, our_score, their_score, tracked):
+    outcome = "won" if won else "lost"
+    recap = f"Your queue {outcome} on {map_name}, {our_score}-{their_score}."
+    if not tracked:
+        return recap
+    standout = max(tracked, key=lambda item: item["st"].get("score", 0))
+    p, st = standout["p"], standout["st"]
+    player = p.get("name", "A queued player")
+    recap += f" {player} led the tracked players with {st.get('kills', 0)}/{st.get('deaths', 0)}/{st.get('assists', 0)} and {round(st.get('score', 0) / max(our_score + their_score, 1))} ACS."
+    events = []
+    for item in tracked:
+        name = item["p"].get("name", "A queued player")
+        for tag in item["tags"]:
+            if tag in ("QUAD", "ACE"):
+                events.append(f"{name} landed a {tag.lower()}")
+            elif tag.startswith("FIRST BLOOD"):
+                events.append(f"{name} opened {tag.rsplit('x', 1)[-1]} rounds")
+    if events:
+        recap += " " + "; ".join(events[:2]) + "."
+    return recap
 
 
 def _deaths_by_round(detail):
@@ -1276,9 +1326,78 @@ async def play_match_image(detail, queued_players, all_teammates, representative
                         path.write_bytes(await response.read())
         except Exception as exc:
             print(f"Map art unavailable for {map_name}: {exc}")
+    try:
+        catalog = await icon_maps()
+        ids_by_name = {name.casefold(): agent_id for agent_id, name in catalog.get("agent_names", {}).items()}
+        icon_jobs = {}
+        for player in queued_players:
+            agent_obj = player.get("agent") or player.get("character") or {}
+            if not isinstance(agent_obj, dict):
+                agent_obj = {}
+            agent_id = (agent_obj.get("id") or ids_by_name.get(str(agent_obj.get("name", "")).casefold()) or "").lower()
+            icon_url = catalog.get("agents", {}).get(agent_id)
+            if icon_url and player.get("puuid"):
+                icon_jobs[player["puuid"]] = icon_img(icon_url, 60)
+        loaded = await asyncio.gather(*icon_jobs.values()) if icon_jobs else []
+        icons_by_puuid = dict(zip(icon_jobs, loaded))
+    except Exception as exc:
+        print(f"Agent icons unavailable for match card: {exc}")
+        icons_by_puuid = {}
+    # Keep rendering input local; API response objects remain unchanged.
+    render_players = [dict(p, _play_icon=icons_by_puuid.get(p.get("puuid"))) for p in queued_players]
     loop = asyncio.get_running_loop()
-    buffer = await loop.run_in_executor(None, draw_play_result, detail, queued_players, all_teammates, representative, path)
+    buffer = await loop.run_in_executor(None, draw_play_result, detail, render_players, all_teammates, representative, path)
     return discord.File(buffer, filename="match.png")
+
+
+@tree.command(name="testplaycard", description="Preview a sample play-session match card (administrators only)")
+@app_commands.default_permissions(administrator=True)
+async def test_play_card(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can use this command.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    now = datetime.now(timezone.utc)
+    kevin = {
+        "puuid": "test-kevin-puuid", "name": "Kevin", "tag": "TEST", "team_id": "Red",
+        "agent": {"name": "Jett"},
+        "stats": {"kills": 14, "deaths": 17, "assists": 11, "score": 6963,
+                  "headshots": 49, "bodyshots": 106, "legshots": 12},
+    }
+    spam = {
+        "puuid": "test-spam-puuid", "name": "Spam", "tag": "TEST", "team_id": "Red",
+        "agent": {"name": "Chamber"},
+        "stats": {"kills": 7, "deaths": 18, "assists": 7, "score": 3927,
+                  "headshots": 18, "bodyshots": 74, "legshots": 6},
+    }
+    blue = {
+        "puuid": "test-opponent-puuid", "name": "Opponent", "tag": "TEST", "team_id": "Blue",
+        "agent": {"name": "Sova"},
+        "stats": {"kills": 19, "deaths": 10, "assists": 5, "score": 6540,
+                  "headshots": 44, "bodyshots": 83, "legshots": 10},
+    }
+    kills = []
+    for round_number in range(1, 22):
+        killer = kevin if round_number % 2 else spam
+        if round_number == 11:
+            killers = [spam, spam, spam, spam, kevin]
+        else:
+            killers = [killer, blue, kevin if killer is spam else spam]
+        for kill_index, player in enumerate(killers):
+            victim = blue if player["team_id"] == "Red" else (kevin if kill_index % 2 else spam)
+            kills.append({"round": round_number, "time_in_round_in_ms": 1000 + kill_index * 2500,
+                          "killer": {"puuid": player["puuid"]}, "victim": {"puuid": victim["puuid"]}})
+    detail = {
+        "metadata": {"map": {"id": "224b0a95-48b9-f703-1bd8-67aca101a6f", "name": "Abyss"},
+                     "started_at": now.isoformat(), "game_length_in_ms": 44 * 60 * 1000},
+        "teams": [
+            {"team_id": "Red", "won": False, "rounds": {"won": 8, "lost": 13}, "premier_roster": {"name": "Queue"}},
+            {"team_id": "Blue", "won": True, "rounds": {"won": 13, "lost": 8}, "premier_roster": {"name": "Opponents"}},
+        ],
+        "players": [kevin, spam, blue],
+        "kills": kills,
+    }
+    card = await play_match_image(detail, [kevin, spam], [kevin, spam], kevin)
+    await interaction.followup.send(file=card, ephemeral=True)
 
 
 def split_riot_id(text):
@@ -1977,7 +2096,7 @@ for _cmd in (agent_cmd, assignagent, lineup, clearagent):
 HELP_SECTIONS = [
     ("Premier", ["schedule", "results", "mapresults", "scout", "agent", "lineup", "clearagent", "playbook"]),
     ("Players", ["register", "unregister", "accounts", "rank", "player", "play"]),
-    ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "clearcache"]),
+    ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "testplaycard", "clearcache"]),
     ("Troubleshooting", ["findteam", "debug"]),
 ]
 
