@@ -277,8 +277,8 @@ async def history():
     return await history_from_players()
 
 
-async def match_detail(match_id: str):
-    return await api(f"/valorant/v4/match/{AFFINITY}/{match_id}")
+async def match_detail(match_id: str, region=None):
+    return await api(f"/valorant/v4/match/{region or AFFINITY}/{match_id}")
 
 
 # ---------- Match summarising ----------
@@ -1400,6 +1400,52 @@ async def test_play_card(interaction: discord.Interaction):
     await interaction.followup.send(file=card, ephemeral=True)
 
 
+@tree.command(name="recent", description="Show a player's most recent competitive match card")
+@app_commands.describe(player="Mention a member with a linked account (defaults to you)")
+async def recent_cmd(interaction: discord.Interaction, player: discord.Member = None):
+    target = player or interaction.user
+    account = load_accounts().get(str(target.id))
+    if not account:
+        return await interaction.response.send_message(
+            f"{getattr(target, 'display_name', target.name)} needs to link a VALORANT account with /register first.",
+            ephemeral=True,
+        )
+    await interaction.response.defer()
+    region = account.get("region") or AFFINITY
+    try:
+        history = await cached_api(
+            f"/valorant/v1/stored-matches/{region}/{quote(account['name'])}/{quote(account['tag'])}",
+            120, mode="competitive", size=10,
+        )
+        matches = [m for m in history or [] if (m.get("meta") or {}).get("id")]
+        matches.sort(key=lambda m: (m.get("meta") or {}).get("started_at") or "", reverse=True)
+        if not matches:
+            return await interaction.followup.send(f"No completed competitive matches found for {account['name']}#{account['tag']}.")
+        latest = matches[0]
+        meta = latest.get("meta") or {}
+        match_id = meta["id"]
+        detail = await cached(
+            f"recentmatch:{region}:{match_id}", None,
+            lambda: match_detail(match_id, region),
+        )
+        player_stats = latest.get("stats") or {}
+        puuid = player_stats.get("puuid")
+        participants = detail.get("players", [])
+        target_player = next((p for p in participants if puuid and p.get("puuid") == puuid), None)
+        if not target_player:
+            wanted = f"{account['name']}#{account['tag']}".casefold()
+            target_player = next((p for p in participants
+                                  if f"{p.get('name', '')}#{p.get('tag', '')}".casefold() == wanted), None)
+        if not target_player:
+            return await interaction.followup.send("I found the match, but couldn't match the linked account to its scoreboard.")
+        team_id = target_player.get("team_id")
+        teammates = [p for p in participants if p.get("team_id") == team_id]
+        card = await play_match_image(detail, teammates, teammates, target_player)
+        await interaction.followup.send(file=card, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:
+        await interaction.followup.send(f"Couldn't load the recent match: {str(exc)[:300]}")
+
+
 def split_riot_id(text):
     name, sep, tag = (text or "").strip().rpartition("#")
     return (name.strip(), tag.strip()) if sep and name.strip() and tag.strip() else None
@@ -2095,7 +2141,7 @@ for _cmd in (agent_cmd, assignagent, lineup, clearagent):
 
 HELP_SECTIONS = [
     ("Premier", ["schedule", "results", "mapresults", "scout", "agent", "lineup", "clearagent", "playbook"]),
-    ("Players", ["register", "unregister", "accounts", "rank", "player", "play"]),
+    ("Players", ["register", "unregister", "accounts", "rank", "player", "recent", "play"]),
     ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "testplaycard", "clearcache"]),
     ("Troubleshooting", ["findteam", "debug"]),
 ]
