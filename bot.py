@@ -461,6 +461,19 @@ async def icon_img(url, size):
 COLS = [("ACS", 500), ("K", 565), ("D", 610), ("A", 655), ("+/-", 715), ("K/D", 780), ("ADR", 845), ("HS%", 910), ("FB", 965)]
 GREY = (150, 162, 175)
 WHITE = (240, 244, 248)
+PLAY_TAG_STYLES = {
+    "MVP": ((109, 79, 38), (255, 214, 128)),
+    "LVP": ((105, 39, 45), (255, 151, 157)),
+    "VICTIM": ((67, 68, 78), (211, 214, 224)),
+    "ACE": ((141, 91, 32), (255, 223, 132)),
+    "QUAD": ((119, 93, 33), (255, 218, 119)),
+    "ENTRY": ((39, 78, 122), (163, 205, 255)),
+    "DINK MACHINE": ((89, 59, 126), (219, 183, 255)),
+    "ASSIST KING": ((35, 100, 91), (153, 235, 214)),
+    "DAMAGE DEALER": ((137, 68, 37), (255, 187, 143)),
+    "SURVIVOR": ((48, 98, 63), (170, 237, 178)),
+    "CLUTCH": ((123, 55, 92), (255, 172, 218)),
+}
 
 
 def draw_scoreboard(s, icons):
@@ -1182,6 +1195,15 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     team_lvp_id = min(stats_by_id, key=lambda puuid: stats_by_id[puuid].get("score", 0)) if stats_by_id else None
     round_count = max(our_score + their_score, 1)
     deaths_by_round = _deaths_by_round(detail)
+    clutch_wins = _clutch_wins(detail, all_teammates)
+    assists_by_id = {p.get("puuid"): (p.get("stats") or {}).get("assists", 0) for p in all_teammates}
+    damage_by_id = {
+        p.get("puuid"): round(((p.get("stats") or {}).get("damage") or {}).get("dealt", 0) / round_count)
+        for p in all_teammates
+    }
+    most_assists = max(assists_by_id.values(), default=0)
+    highest_adr = max(damage_by_id.values(), default=0)
+    lowest_deaths = min(((p.get("stats") or {}).get("deaths", 0) for p in all_teammates), default=0)
     tracked = []
     for p in queued_players:
         st = p.get("stats", {})
@@ -1193,6 +1215,16 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         if best_round >= 5: tags.append("ACE")
         elif best_round == 4: tags.append("QUAD")
         if puuid == team_mvp_id: tags.append("MVP")
+        if first_bloods.get(puuid, 0) >= 3: tags.append("ENTRY")
+        if st.get("kills", 0) >= 15 and hs >= 30: tags.append("DINK MACHINE")
+        if most_assists >= 8 and assists_by_id.get(puuid, 0) == most_assists: tags.append("ASSIST KING")
+        if highest_adr >= 160 and damage_by_id.get(puuid, 0) == highest_adr: tags.append("DAMAGE DEALER")
+        if round_count >= 10 and ((st.get("deaths", 0) / round_count) <= 0.45) and st.get("deaths", 0) == lowest_deaths:
+            tags.append("SURVIVOR")
+        clutch_count = clutch_wins.get(puuid, 0)
+        max_clutches = max(clutch_wins.values(), default=0)
+        if max_clutches > 0 and clutch_count == max_clutches:
+            tags.append(f"CLUTCH x{clutch_count}")
         death_rounds = sum(1 for events in deaths_by_round.values() if events.get(puuid, 0) > 0)
         if round_count > 0 and death_rounds >= round_count: tags.append("VICTIM")
         if puuid == team_lvp_id: tags.append("LVP")
@@ -1206,9 +1238,16 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             half_deaths[half] += events.get(puuid, 0)
         tracked.append({"p": p, "st": st, "hs": hs, "tags": tags,
                         "h1": f"{half_kills[0]}/{half_deaths[0]}", "h2": f"{half_kills[1]}/{half_deaths[1]}",
-                        "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0)})
+                        "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0),
+                        "adr": damage_by_id.get(puuid, 0)})
 
-    width, hero_h, summary_h, card_h, gap = 1200, 270, 430, 280, 18
+    width, hero_h, card_h, gap = 1200, 270, 300, 18
+    recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
+    headline = _play_headline(all_teammates, our_score, their_score)
+    recap_font = font(23, serif=True)
+    measure_draw = ImageDraw.Draw(Image.new("RGB", (width, 1)))
+    recap_lines = _wrap_image_text(measure_draw, recap, recap_font, width - 64, 7)
+    summary_h = 116 + max(0, len(recap_lines) - 1) * 39
     columns, side_pad, column_gap = 2, 24, 18
     card_width = (width - 2 * side_pad - column_gap) // columns
     rows = max(1, (len(tracked) + columns - 1) // columns)
@@ -1228,36 +1267,30 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         except Exception:
             pass
     draw.rectangle((0, hero_h, width, height), fill=(17, 17, 22))
-    accent = (82, 196, 120) if won else (220, 83, 91)
+    accent = (76, 190, 112) if won else (224, 92, 99)
     f_title, f_sub, f_name, f_stat, f_small = font(42, True), font(20), font(24, True), font(23, True), font(16)
-    draw.text((38, 155), map_name.upper(), font=font(48, True), fill=WHITE, anchor="lm")
+    draw.text((38, 155), map_name.upper(), font=font(54, True), fill=(248, 248, 250), anchor="lm")
     date_label = started.astimezone(timezone.utc).strftime("%b %d, %Y, %I:%M %p") if started else "Time unavailable"
     draw.text((40, 209), f"Competitive | {duration} | {date_label}", font=f_sub, fill=(205, 207, 214), anchor="lm")
     badge = f"{'Victory' if won else 'Defeat'} {our_score}-{their_score}"
     draw.rounded_rectangle((width - 255, 174, width - 34, 226), radius=24, fill=accent)
     draw.text((width - 144, 200), badge, font=font(22, True), fill=WHITE, anchor="mm")
-    hero_player = max(tracked, key=lambda item: item["st"].get("score", 0), default=None)
-    hero_icon = hero_player["p"].get("_play_icon") if hero_player else None
-    if hero_icon:
-        hero_icon = ImageOps.contain(hero_icon.convert("RGBA"), (112, 112), method=Image.Resampling.LANCZOS)
-        draw.rounded_rectangle((width - 160, 20, width - 28, 152), radius=18, fill=(35, 38, 47), outline=(85, 89, 101), width=2)
-        image.paste(hero_icon, (width - 24 - hero_icon.width, 24 + (112 - hero_icon.height) // 2), hero_icon)
-    recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
-    headline = _play_headline(all_teammates, our_score, their_score)
-    draw.text((32, hero_h + 44), headline, font=font(28, True), fill=(235, 105, 110), anchor="lm")
-    recap_lines = _wrap_image_text(draw, recap, font(23, serif=True), width - 64, 7)
+    draw.text((32, hero_h + 44), headline, font=font(32, True), fill=(240, 105, 112), anchor="lm")
     for line_index, line in enumerate(recap_lines):
-        draw.text((32, hero_h + 100 + line_index * 39), line, font=font(23, serif=True), fill=(226, 226, 232), anchor="lm")
+        draw.text((32, hero_h + 100 + line_index * 39), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
     for index, item in enumerate(tracked):
         col, row = index % columns, index // columns
-        x = side_pad + col * (card_width + column_gap)
+        if len(tracked) % columns and row == rows - 1:
+            x = (width - card_width) // 2
+        else:
+            x = side_pad + col * (card_width + column_gap)
         y = cards_top + row * (card_h + gap)
         right = x + card_width
-        draw.rounded_rectangle((x, y, right, y + card_h), radius=20, fill=(28, 28, 34), outline=(40, 40, 48), width=2)
+        draw.rounded_rectangle((x, y, right, y + card_h), radius=20, fill=(29, 28, 34), outline=(39, 38, 45), width=2)
         p, st = item["p"], item["st"]
         agent_obj = p.get("agent") or p.get("character") or {}
         agent = (agent_obj.get("name") or agent_obj.get("display_name") or agent_obj.get("displayName") or "Agent") if isinstance(agent_obj, dict) else str(agent_obj)
-        icon = item.get("_play_icon")
+        icon = p.get("_play_icon")
         icon_box = (x + 22, y + 22, x + 92, y + 92)
         draw.rounded_rectangle(icon_box, radius=12, fill=(48, 53, 68))
         if icon:
@@ -1265,17 +1298,27 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             icon_x = x + 24 + (66 - icon.width) // 2
             icon_y = y + 24 + (66 - icon.height) // 2
             image.paste(icon, (icon_x, icon_y), icon)
-        draw.text((x + 108, y + 43), f"{p.get('name', '?')}#{p.get('tag', '')}", font=font(26, True), fill=(145, 190, 255), anchor="lm")
+        player_name = str(p.get("name", "?"))
+        player_name_size = 28
+        player_name_font = font(player_name_size, True)
+        while player_name_size > 18 and draw.textlength(player_name, font=player_name_font) > right - x - 132:
+            player_name_size -= 1
+            player_name_font = font(player_name_size, True)
+        draw.text((x + 108, y + 43), player_name, font=player_name_font, fill=(157, 191, 255), anchor="lm")
         draw.text((x + 108, y + 75), agent, font=font(17), fill=GREY, anchor="lm")
-        tx = x + 22
+        tx, tag_row = x + 22, 0
+        tag_font = font(14, True)
         for tag in item["tags"]:
-            tw = int(draw.textlength(tag, font=font(17, True))) + 26
+            tw = int(draw.textlength(tag, font=tag_font)) + 22
             max_right = right - 20
             if tx + tw > max_right:
+                tag_row += 1
                 tx = x + 22
-            tag_colour = (116, 85, 42) if tag == "MVP" else (136, 59, 65) if tag in ("LVP", "VICTIM") else (130, 91, 34)
-            draw.rounded_rectangle((tx, y + 110, tx + tw, y + 148), radius=8, fill=tag_colour)
-            draw.text((tx + tw / 2, y + 129), tag, font=font(17, True), fill=(255, 225, 157), anchor="mm")
+            tag_key = tag.split(" x", 1)[0]
+            tag_colour, tag_text = PLAY_TAG_STYLES.get(tag_key, ((68, 68, 78), (235, 235, 240)))
+            tag_y = y + 110 + tag_row * 38
+            draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 32), radius=7, fill=tag_colour)
+            draw.text((tx + tw / 2, tag_y + 16), tag, font=tag_font, fill=tag_text, anchor="mm")
             tx += tw + 9
         labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
                   ("ACS", str(round(st.get("score", 0) / round_count))),
@@ -1283,9 +1326,9 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         cell_w = (right - x - 44) // 3
         for cell, (label, value) in enumerate(labels):
             cx = x + 22 + cell * cell_w + cell_w // 2
-            draw.text((cx, y + 174), label, font=font(16), fill=(136, 138, 149), anchor="mm")
-            draw.text((cx, y + 208), value, font=font(25, True), fill=WHITE, anchor="mm")
-        draw.text(((x + right) // 2, y + 254),
+            draw.text((cx, y + 204), label, font=font(16), fill=(136, 138, 149), anchor="mm")
+            draw.text((cx, y + 235), value, font=font(25, True), fill=WHITE, anchor="mm")
+        draw.text(((x + right) // 2, y + 278),
                   f"HS {item['hs']}% | H1 {item['h1']} | H2 {item['h2']} | FB {item['fb']} | FD {item['fd']}",
                   font=font(16), fill=(145, 147, 158), anchor="mm")
     buffer = io.BytesIO()
@@ -1357,6 +1400,18 @@ def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, d
                 events.append(f"{name} landed a {tag.lower()} and immediately became impossible to queue with")
             elif tag == "VICTIM":
                 events.append(f"{name} died in every round, a truly committed performance")
+            elif tag == "ENTRY":
+                events.append(f"{name} kicked open {item['fb']} rounds with first bloods")
+            elif tag == "DINK MACHINE":
+                events.append(f"{name} hit {item['hs']}% headshots and is now legally allowed to say 'nice crosshair'")
+            elif tag == "ASSIST KING":
+                events.append(f"{name} handed out {item['st'].get('assists', 0)} assists like party invites")
+            elif tag == "DAMAGE DEALER":
+                events.append(f"{name} put up {item['adr']} ADR and kept the damage numbers employed")
+            elif tag == "SURVIVOR":
+                events.append(f"{name} only went down {item['st'].get('deaths', 0)} times and stayed out of the respawn queue")
+            elif tag.startswith("CLUTCH"):
+                events.append(f"{name} won {tag.rsplit('x', 1)[-1]} clutch round(s) and will mention it all week")
     if events:
         recap += " " + "; ".join(events[:2]) + "."
     margin = abs(our_score - their_score)
@@ -1389,6 +1444,43 @@ def _deaths_by_round(detail):
             round_number = event.get("round", 0) or 0
             deaths.setdefault(round_number, {})[victim] = deaths.setdefault(round_number, {}).get(victim, 0) + 1
     return deaths
+
+
+def _clutch_wins(detail, players):
+    """Count won rounds where a player was left alone against at least two opponents."""
+    roster = detail.get("players") or players
+    team_by_puuid = {p.get("puuid"): p.get("team_id") for p in roster if p.get("puuid") and p.get("team_id")}
+    members_by_team = {}
+    for puuid, team_id in team_by_puuid.items():
+        members_by_team.setdefault(team_id, set()).add(puuid)
+    if len(members_by_team) < 2:
+        return {}
+    kills_by_round = {}
+    for event in detail.get("kills") or []:
+        kills_by_round.setdefault(event.get("round", 0) or 0, []).append(event)
+    clutch_counts = {}
+    for index, round_data in enumerate(detail.get("rounds") or []):
+        round_number = round_data.get("id", index)
+        winner_text = str(round_data.get("winning_team") or "").casefold()
+        winner = next((team for team in members_by_team if str(team).casefold() == winner_text), None)
+        if winner is None:
+            continue
+        alive = {team: set(puuids) for team, puuids in members_by_team.items()}
+        possible_clutchers = set()
+        events = sorted(kills_by_round.get(round_number, []), key=lambda event: event.get("time_in_round_in_ms", 0))
+        for event in events:
+            victim = (event.get("victim") or {}).get("puuid")
+            victim_team = team_by_puuid.get(victim)
+            if victim and victim_team in alive:
+                alive[victim_team].discard(victim)
+            for team, team_players in alive.items():
+                opponents_alive = sum(len(other) for other_id, other in alive.items() if other_id != team)
+                if len(team_players) == 1 and opponents_alive >= 2:
+                    possible_clutchers.update(team_players)
+        for puuid in possible_clutchers:
+            if team_by_puuid.get(puuid) == winner and puuid in alive.get(winner, set()):
+                clutch_counts[puuid] = clutch_counts.get(puuid, 0) + 1
+    return clutch_counts
 
 
 async def play_match_image(detail, queued_players, all_teammates, representative):
