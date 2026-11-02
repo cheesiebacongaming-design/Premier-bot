@@ -1148,7 +1148,10 @@ async def play_match_embed(detail, queued_players, representative):
             half_stats.setdefault(victim, [[0, 0], [0, 0]])[half][1] += 1
     for p in queued_players:
         st = p.get("stats", {})
-        rounds = max(sum((t.get("rounds") or {}).get(k, 0) for k in ("won", "lost")) for t in teams.values()) if teams else 1, 1)
+        rounds = max(
+            (sum((t.get("rounds") or {}).get(k, 0) for k in ("won", "lost")) for t in teams.values()),
+            default=1,
+        )
         shots = st.get("headshots", 0) + st.get("bodyshots", 0) + st.get("legshots", 0)
         hs = round(st.get("headshots", 0) * 100 / shots) if shots else 0
         tags = []
