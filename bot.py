@@ -382,12 +382,23 @@ def player_table(rows):
 
 
 # ---------- Scoreboard image ----------
-FONT_REG = ["segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"]
-FONT_BOLD = ["segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf"]
+FONT_REG = ["segoeui.ttf", "arial.ttf", "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"]
+FONT_BOLD = ["segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"]
+FONT_SERIF = ["Georgia.ttf", "DejaVuSerif.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+              "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf"]
+FONT_SERIF_BOLD = ["Georgia Bold.ttf", "DejaVuSerif-Bold.ttf",
+                   "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+                   "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf"]
 
 
-def font(size, bold=False):
-    for name in FONT_BOLD if bold else FONT_REG:
+def font(size, bold=False, serif=False):
+    candidates = (FONT_SERIF_BOLD if bold else FONT_SERIF) if serif else (FONT_BOLD if bold else FONT_REG)
+    for name in candidates:
         try:
             return ImageFont.truetype(name, size)
         except OSError:
@@ -399,7 +410,7 @@ def font(size, bold=False):
 
 
 async def icon_maps():
-    """agent uuid -> icon url, rank tier -> icon url (valorant-api.com, cached a week)."""
+    """Agent image URLs and rank tier icons from valorant-api.com, cached a week."""
 
     async def fetch():
         async def get_json(url):
@@ -412,12 +423,21 @@ async def icon_maps():
         )
         agents, tiers = agents_data["data"], tiers_data["data"]
         return {
-            "agents": {a["uuid"].lower(): a["displayIcon"] for a in agents},
+            "agents": {a["uuid"].lower(): (a.get("displayIcon") or a.get("killfeedPortrait") or a.get("bustPortrait") or a.get("fullPortrait")) for a in agents},
+            "agent_icon_urls": {
+                a["uuid"].lower(): list(dict.fromkeys(
+                    url for url in (a.get("displayIcon"), a.get("bustPortrait"), a.get("fullPortrait"), a.get("killfeedPortrait")) if url
+                )) for a in agents
+            },
             "agent_names": {a["uuid"].lower(): a["displayName"] for a in agents},
             "tiers": {str(t["tier"]): t.get("smallIcon") for t in tiers[-1]["tiers"]},
         }
 
-    return await cached("icons:maps2", 7 * 86400, fetch)
+    try:
+        return await cached("icons:maps3", 7 * 86400, fetch)
+    except Exception:
+        # Continue using the repository's older cached image catalog if the asset host is down.
+        return await cached("icons:maps2", None, fetch)
 
 
 async def icon_img(url, size):
@@ -1215,9 +1235,11 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     draw.rounded_rectangle((width - 340, 140, width - 38, 204), radius=25, fill=accent)
     draw.text((width - 189, 172), badge, font=font(23, True), fill=WHITE, anchor="mm")
     recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates)
-    recap_lines = _wrap_image_text(draw, recap, font(16), width - 80, 4)
+    headline = _play_headline(all_teammates, our_score, their_score)
+    draw.text((40, 236), headline, font=font(20, True), fill=(238, 112, 118), anchor="lm")
+    recap_lines = _wrap_image_text(draw, recap, font(17, serif=True), width - 80, 4)
     for line_index, line in enumerate(recap_lines):
-        draw.text((40, 242 + line_index * 23), line, font=font(16), fill=(232, 234, 239), anchor="lm")
+        draw.text((40, 268 + line_index * 24), line, font=font(17, serif=True), fill=(232, 234, 239), anchor="lm")
     for index, item in enumerate(tracked):
         col, row = index % columns, index // columns
         x = side_pad + col * (card_width + column_gap)
@@ -1231,8 +1253,10 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         icon_box = (x + 22, y + 20, x + 86, y + 84)
         draw.rounded_rectangle(icon_box, radius=12, fill=(48, 53, 68))
         if icon:
-            icon = ImageOps.fit(icon.convert("RGBA"), (60, 60), method=Image.Resampling.LANCZOS)
-            image.paste(icon, (x + 24, y + 22), icon)
+            icon = ImageOps.contain(icon.convert("RGBA"), (60, 60), method=Image.Resampling.LANCZOS)
+            icon_x = x + 24 + (60 - icon.width) // 2
+            icon_y = y + 22 + (60 - icon.height) // 2
+            image.paste(icon, (icon_x, icon_y), icon)
         draw.text((x + 94, y + 42), f"{p.get('name', '?')}#{p.get('tag', '')}", font=f_name, fill=(145, 190, 255), anchor="lm")
         draw.text((x + 94, y + 72), agent, font=f_small, fill=GREY, anchor="lm")
         tx = x + 22
@@ -1312,6 +1336,19 @@ def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates):
     return recap
 
 
+def _play_headline(all_teammates, our_score, their_score):
+    if not all_teammates:
+        return "MATCH RECAP"
+    weakest = min(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0))
+    strongest = max(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0))
+    if weakest.get("puuid") == strongest.get("puuid"):
+        return f"{our_score}-{their_score} MATCH RECAP"
+    stats = weakest.get("stats") or {}
+    acs = round(stats.get("score", 0) / max(our_score + their_score, 1))
+    name = weakest.get("name", "PLAYER").upper()
+    return f"ROUGHEST LINE: {name} AT {acs} ACS"
+
+
 def _deaths_by_round(detail):
     deaths = {}
     for event in detail.get("kills") or []:
@@ -1344,6 +1381,7 @@ async def play_match_image(detail, queued_players, all_teammates, representative
         catalog = await icon_maps()
         ids_by_name = {name.casefold(): agent_id for agent_id, name in catalog.get("agent_names", {}).items()}
         icon_jobs = {}
+        agent_names_by_puuid = {}
         for player in queued_players:
             agent_obj = player.get("agent") or player.get("character") or {}
             if isinstance(agent_obj, dict):
@@ -1354,11 +1392,22 @@ async def play_match_image(detail, queued_players, all_teammates, representative
             agent_id = str(raw_agent_id).lower()
             if agent_id not in catalog.get("agents", {}):
                 agent_id = ids_by_name.get(agent_name.casefold(), "").lower()
-            icon_url = catalog.get("agents", {}).get(agent_id)
-            if icon_url and player.get("puuid"):
-                icon_jobs[player["puuid"]] = icon_img(icon_url, 60)
+            icon_urls = catalog.get("agent_icon_urls", {}).get(agent_id) or [catalog.get("agents", {}).get(agent_id)]
+            icon_urls = [url for url in icon_urls if url]
+            if icon_urls and player.get("puuid"):
+                agent_names_by_puuid[player["puuid"]] = agent_name
+                async def fetch_agent_icon(urls=icon_urls):
+                    for url in urls:
+                        image = await icon_img(url, 60)
+                        if image is not None:
+                            return image
+                    return None
+                icon_jobs[player["puuid"]] = fetch_agent_icon()
         loaded = await asyncio.gather(*icon_jobs.values()) if icon_jobs else []
         icons_by_puuid = dict(zip(icon_jobs, loaded))
+        missing = [agent_names_by_puuid[puuid] for puuid, icon in icons_by_puuid.items() if icon is None]
+        if missing:
+            print("Agent art unavailable for match card: " + ", ".join(missing))
     except Exception as exc:
         print(f"Agent icons unavailable for match card: {exc}")
         icons_by_puuid = {}
