@@ -425,6 +425,17 @@ def match_font(size, bold=False, serif=False):
         return font(size, bold=bold, serif=serif)
 
 
+def draw_soft_box(image, box, fill, opacity=224, radius=4):
+    """Draw a lightly transparent, compact chip on an existing RGB image."""
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(
+        (0, 0, width - 1, height - 1), radius=radius, fill=(*fill, opacity)
+    )
+    image.paste(layer, (left, top), layer)
+
+
 async def icon_maps():
     """Agent image URLs and rank tier icons from valorant-api.com, cached a week."""
 
@@ -1166,7 +1177,7 @@ async def play_session_loop():
                     teammates = [p for p in participants if p.get("team_id") == team]
                     queued = [p for p in teammates
                               if f"{p.get('name','')}#{p.get('tag','')}".casefold() in acc_names]
-                    card = await play_match_image(detail, queued, teammates, ours[0])
+                    card = await play_match_image(detail, queued, queued, ours[0])
                     await channel.send(file=card, allowed_mentions=discord.AllowedMentions.none())
             except Exception as exc:
                 print(f"Play session poll failed for channel {key}: {exc}")
@@ -1258,7 +1269,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     measure_draw = ImageDraw.Draw(Image.new("RGB", (width, 1)))
     columns, side_pad, column_gap = 2, 24, 18
     recap_lines = _wrap_image_text(measure_draw, recap, recap_font, width - 2 * side_pad, 7)
-    summary_h = 152 + max(0, len(recap_lines) - 1) * 42
+    summary_h = 114 + max(0, len(recap_lines) - 1) * 42
     card_width = (width - 2 * side_pad - column_gap) // columns
     tag_font = match_font(14, True)
     tag_width_limit = card_width - 132
@@ -1301,7 +1312,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     draw.text((side_pad, 224), f"Competitive · {duration} · {date_label}", font=f_sub, fill=(207, 205, 210), anchor="lm")
     badge = f"{our_score}-{their_score}"
     badge_box = (width - side_pad - 208, 186, width - side_pad, 238)
-    draw.rounded_rectangle(badge_box, radius=18, fill=accent)
+    draw_soft_box(image, badge_box, accent, opacity=238, radius=7)
     draw.text(((badge_box[0] + badge_box[2]) // 2, (badge_box[1] + badge_box[3]) // 2), badge,
               font=match_font(21, True), fill=(255, 250, 250), anchor="mm")
     coral = (240, 99, 106)
@@ -1351,7 +1362,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             tag_key = tag.split(" x", 1)[0]
             tag_colour, tag_text = PLAY_TAG_STYLES.get(tag_key, ((68, 68, 78), (235, 235, 240)))
             tag_y = y + 54 + tag_row * 32
-            draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 30), radius=6, fill=tag_colour)
+            draw_soft_box(image, (tx, tag_y, tx + tw, tag_y + 30), tag_colour, opacity=222, radius=3)
             draw.text((tx + tw / 2, tag_y + 15), tag, font=tag_font, fill=tag_text, anchor="mm")
             tx += tw + 6
         stat_label_y = y + 118 + tag_row * 32
@@ -1682,7 +1693,24 @@ async def recent_cmd(interaction: discord.Interaction, player: discord.Member = 
             return await interaction.followup.send("I found the match, but couldn't match the linked account to its scoreboard.")
         team_id = target_player.get("team_id")
         teammates = [p for p in participants if p.get("team_id") == team_id]
-        card = await play_match_image(detail, teammates, teammates, target_player)
+        target_id = str(target.id)
+        sessions = load_play_sessions()
+        session = sessions.get(str(interaction.channel_id))
+        if not session or target_id not in {str(uid) for uid in session.get("players", [])}:
+            session = next((candidate for candidate in sessions.values()
+                            if str(candidate.get("guild_id")) == str(interaction.guild_id)
+                            and target_id in {str(uid) for uid in candidate.get("players", [])}), None)
+        queued_names = {f"{account['name']}#{account['tag']}".casefold()}
+        if session:
+            linked_accounts = load_accounts()
+            queued_names.update(
+                f"{linked_accounts[str(uid)]['name']}#{linked_accounts[str(uid)]['tag']}".casefold()
+                for uid in session.get("players", []) if str(uid) in linked_accounts
+            )
+        queued = [p for p in teammates if f"{p.get('name', '')}#{p.get('tag', '')}".casefold() in queued_names]
+        if all(p.get("puuid") != target_player.get("puuid") for p in queued):
+            queued.insert(0, target_player)
+        card = await play_match_image(detail, queued, queued, target_player)
         await interaction.followup.send(file=card, allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         await interaction.followup.send(f"Couldn't load the recent match: {str(exc)[:300]}")
