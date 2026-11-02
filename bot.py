@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -1207,67 +1208,74 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
                         "h1": f"{half_kills[0]}/{half_deaths[0]}", "h2": f"{half_kills[1]}/{half_deaths[1]}",
                         "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0)})
 
-    width, header_h, card_h, gap = 1200, 405, 280, 18
+    width, hero_h, summary_h, card_h, gap = 1200, 270, 430, 280, 18
     columns, side_pad, column_gap = 2, 24, 18
     card_width = (width - 2 * side_pad - column_gap) // columns
     rows = max(1, (len(tracked) + columns - 1) // columns)
-    height = header_h + 64 + rows * (card_h + gap) + 10
+    cards_top = hero_h + summary_h + 22
+    height = cards_top + rows * (card_h + gap) - gap + 26
     image = Image.new("RGB", (width, height), (17, 17, 22))
     draw = ImageDraw.Draw(image)
     if map_path and Path(map_path).exists():
         try:
             bg = Image.open(map_path).convert("RGB")
-            ratio = max(width / bg.width, header_h / bg.height)
+            ratio = max(width / bg.width, hero_h / bg.height)
             bg = bg.resize((int(bg.width * ratio), int(bg.height * ratio)))
-            left, top = (bg.width - width) // 2, (bg.height - header_h) // 2
-            bg = bg.crop((left, top, left + width, top + header_h))
+            left, top = (bg.width - width) // 2, (bg.height - hero_h) // 2
+            bg = bg.crop((left, top, left + width, top + hero_h))
             bg = Image.blend(bg, Image.new("RGB", bg.size, (8, 10, 15)), 0.56)
             image.paste(bg, (0, 0))
         except Exception:
             pass
-    draw.rectangle((0, header_h, width, height), fill=(17, 17, 22))
+    draw.rectangle((0, hero_h, width, height), fill=(17, 17, 22))
     accent = (82, 196, 120) if won else (220, 83, 91)
     f_title, f_sub, f_name, f_stat, f_small = font(42, True), font(20), font(24, True), font(23, True), font(16)
-    draw.text((38, 150), map_name.upper(), font=f_title, fill=WHITE, anchor="lm")
-    date_label = started.astimezone(timezone.utc).strftime("%b %d, %Y | %H:%M UTC") if started else "Time unavailable"
-    draw.text((40, 198), f"COMPETITIVE | {duration} | {date_label}", font=f_sub, fill=(210, 214, 220), anchor="lm")
-    badge = f"{'VICTORY' if won else 'DEFEAT'}  {our_score}-{their_score}"
-    draw.rounded_rectangle((width - 340, 140, width - 38, 204), radius=25, fill=accent)
-    draw.text((width - 189, 172), badge, font=font(23, True), fill=WHITE, anchor="mm")
-    recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates)
+    draw.text((38, 155), map_name.upper(), font=font(48, True), fill=WHITE, anchor="lm")
+    date_label = started.astimezone(timezone.utc).strftime("%b %d, %Y, %I:%M %p") if started else "Time unavailable"
+    draw.text((40, 209), f"Competitive | {duration} | {date_label}", font=f_sub, fill=(205, 207, 214), anchor="lm")
+    badge = f"{'Victory' if won else 'Defeat'} {our_score}-{their_score}"
+    draw.rounded_rectangle((width - 255, 174, width - 34, 226), radius=24, fill=accent)
+    draw.text((width - 144, 200), badge, font=font(22, True), fill=WHITE, anchor="mm")
+    hero_player = max(tracked, key=lambda item: item["st"].get("score", 0), default=None)
+    hero_icon = hero_player["p"].get("_play_icon") if hero_player else None
+    if hero_icon:
+        hero_icon = ImageOps.contain(hero_icon.convert("RGBA"), (112, 112), method=Image.Resampling.LANCZOS)
+        draw.rounded_rectangle((width - 160, 20, width - 28, 152), radius=18, fill=(35, 38, 47), outline=(85, 89, 101), width=2)
+        image.paste(hero_icon, (width - 24 - hero_icon.width, 24 + (112 - hero_icon.height) // 2), hero_icon)
+    recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
     headline = _play_headline(all_teammates, our_score, their_score)
-    draw.text((40, 236), headline, font=font(20, True), fill=(238, 112, 118), anchor="lm")
-    recap_lines = _wrap_image_text(draw, recap, font(17, serif=True), width - 80, 4)
+    draw.text((32, hero_h + 44), headline, font=font(28, True), fill=(235, 105, 110), anchor="lm")
+    recap_lines = _wrap_image_text(draw, recap, font(23, serif=True), width - 64, 7)
     for line_index, line in enumerate(recap_lines):
-        draw.text((40, 268 + line_index * 24), line, font=font(17, serif=True), fill=(232, 234, 239), anchor="lm")
+        draw.text((32, hero_h + 100 + line_index * 39), line, font=font(23, serif=True), fill=(226, 226, 232), anchor="lm")
     for index, item in enumerate(tracked):
         col, row = index % columns, index // columns
         x = side_pad + col * (card_width + column_gap)
-        y = header_h + 20 + row * (card_h + gap)
+        y = cards_top + row * (card_h + gap)
         right = x + card_width
-        draw.rounded_rectangle((x, y, right, y + card_h), radius=18, fill=(30, 30, 37), outline=(50, 50, 60), width=2)
+        draw.rounded_rectangle((x, y, right, y + card_h), radius=20, fill=(28, 28, 34), outline=(40, 40, 48), width=2)
         p, st = item["p"], item["st"]
         agent_obj = p.get("agent") or p.get("character") or {}
         agent = (agent_obj.get("name") or agent_obj.get("display_name") or agent_obj.get("displayName") or "Agent") if isinstance(agent_obj, dict) else str(agent_obj)
         icon = item.get("_play_icon")
-        icon_box = (x + 22, y + 20, x + 86, y + 84)
+        icon_box = (x + 22, y + 22, x + 92, y + 92)
         draw.rounded_rectangle(icon_box, radius=12, fill=(48, 53, 68))
         if icon:
-            icon = ImageOps.contain(icon.convert("RGBA"), (60, 60), method=Image.Resampling.LANCZOS)
-            icon_x = x + 24 + (60 - icon.width) // 2
-            icon_y = y + 22 + (60 - icon.height) // 2
+            icon = ImageOps.contain(icon.convert("RGBA"), (66, 66), method=Image.Resampling.LANCZOS)
+            icon_x = x + 24 + (66 - icon.width) // 2
+            icon_y = y + 24 + (66 - icon.height) // 2
             image.paste(icon, (icon_x, icon_y), icon)
-        draw.text((x + 94, y + 42), f"{p.get('name', '?')}#{p.get('tag', '')}", font=f_name, fill=(145, 190, 255), anchor="lm")
-        draw.text((x + 94, y + 72), agent, font=f_small, fill=GREY, anchor="lm")
+        draw.text((x + 108, y + 43), f"{p.get('name', '?')}#{p.get('tag', '')}", font=font(26, True), fill=(145, 190, 255), anchor="lm")
+        draw.text((x + 108, y + 75), agent, font=font(17), fill=GREY, anchor="lm")
         tx = x + 22
         for tag in item["tags"]:
-            tw = int(draw.textlength(tag, font=font(14, True))) + 24
+            tw = int(draw.textlength(tag, font=font(17, True))) + 26
             max_right = right - 20
             if tx + tw > max_right:
                 tx = x + 22
             tag_colour = (116, 85, 42) if tag == "MVP" else (136, 59, 65) if tag in ("LVP", "VICTIM") else (130, 91, 34)
-            draw.rounded_rectangle((tx, y + 112, tx + tw, y + 144), radius=7, fill=tag_colour)
-            draw.text((tx + tw / 2, y + 128), tag, font=font(14, True), fill=(255, 225, 157), anchor="mm")
+            draw.rounded_rectangle((tx, y + 110, tx + tw, y + 148), radius=8, fill=tag_colour)
+            draw.text((tx + tw / 2, y + 129), tag, font=font(17, True), fill=(255, 225, 157), anchor="mm")
             tx += tw + 9
         labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
                   ("ACS", str(round(st.get("score", 0) / round_count))),
@@ -1275,11 +1283,11 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         cell_w = (right - x - 44) // 3
         for cell, (label, value) in enumerate(labels):
             cx = x + 22 + cell * cell_w + cell_w // 2
-            draw.text((cx, y + 177), label, font=f_small, fill=GREY, anchor="mm")
-            draw.text((cx, y + 207), value, font=f_stat, fill=WHITE, anchor="mm")
-        draw.text(((x + right) // 2, y + 263),
-                  f"HS {item['hs']}%  |  H1 {item['h1']}  |  H2 {item['h2']}  |  FB {item['fb']}  |  FD {item['fd']}",
-                  font=f_small, fill=(155, 158, 169), anchor="mm")
+            draw.text((cx, y + 174), label, font=font(16), fill=(136, 138, 149), anchor="mm")
+            draw.text((cx, y + 208), value, font=font(25, True), fill=WHITE, anchor="mm")
+        draw.text(((x + right) // 2, y + 254),
+                  f"HS {item['hs']}% | H1 {item['h1']} | H2 {item['h2']} | FB {item['fb']} | FD {item['fd']}",
+                  font=font(16), fill=(145, 147, 158), anchor="mm")
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     buffer.seek(0)
@@ -1305,34 +1313,54 @@ def _wrap_image_text(draw, text, image_font, max_width, max_lines=2):
     return lines
 
 
-def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates):
-    outcome = "won" if won else "lost"
-    recap = f"Your queue {outcome} on {map_name}, {our_score}-{their_score}."
+def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration):
+    result = "snatched the win" if won else "took the L"
+    recap = f"Your queue {result} on {map_name} after {duration} of competitive Valorant, {our_score}-{their_score}."
     if not all_teammates:
         return recap
     ranked = sorted(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0), reverse=True)
     strongest, weakest = ranked[0], ranked[-1]
     top_stats, low_stats = strongest.get("stats") or {}, weakest.get("stats") or {}
-    recap += (f" {strongest.get('name', 'A teammate')} led the team with "
-              f"{round(top_stats.get('score', 0) / max(our_score + their_score, 1))} ACS and "
-              f"{top_stats.get('kills', 0)}/{top_stats.get('deaths', 0)}/{top_stats.get('assists', 0)}.")
+    strongest_name = strongest.get("name", "A teammate")
+    top_acs = round(top_stats.get("score", 0) / max(our_score + their_score, 1))
+    top_kd = top_stats.get("kills", 0) / max(top_stats.get("deaths", 0), 1)
+    top_title = "the team's certified tryhard" if top_acs >= 220 or top_kd >= 1.2 else "the designated carry"
+    recap += (f" {strongest_name} clocked in as {top_title}, topping the team with {top_acs} ACS, "
+              f"{top_stats.get('kills', 0)}/{top_stats.get('deaths', 0)}/{top_stats.get('assists', 0)} "
+              f"and a {top_kd:.2f} KD. Someone's definitely watching the VOD back tonight.")
     if strongest.get("puuid") != weakest.get("puuid"):
-        recap += (f" The toughest performance was {weakest.get('name', 'a teammate')}: lowest team ACS at "
-                  f"{round(low_stats.get('score', 0) / max(our_score + their_score, 1))}, "
+        low_name = weakest.get("name", "a teammate")
+        low_acs = round(low_stats.get("score", 0) / max(our_score + their_score, 1))
+        low_kd = low_stats.get("kills", 0) / max(low_stats.get("deaths", 0), 1)
+        if low_stats.get("deaths", 0) >= 18:
+            roast = random.choice(("the respawn screen got more quality time than the team", "collected deaths like loyalty stamps", "the enemy team learned their route to spawn by heart"))
+        elif low_acs < 100:
+            roast = random.choice(("their crosshair was apparently sightseeing", "their aim took an unscheduled lunch break", "the bullets were social distancing"))
+        elif low_kd < 0.6:
+            roast = random.choice(("the kill feed was not their biggest fan", "their KD ratio needs a pep talk", "the duels were a generous donation program"))
+        else:
+            roast = random.choice(("it was a character-building shift", "the scoreboard has chosen violence", "one to quietly blame on the warm-up"))
+        recap += (f" {low_name} had the roughest shift: {low_acs} ACS and "
                   f"{low_stats.get('kills', 0)}/{low_stats.get('deaths', 0)}/{low_stats.get('assists', 0)} "
-                  f"and {low_stats.get('kills', 0) / max(low_stats.get('deaths', 0), 1):.2f} KD (LVP).")
+                  f"({low_kd:.2f} KD); {roast}.")
+    high_deaths = max(all_teammates, key=lambda p: (p.get("stats") or {}).get("deaths", 0))
+    high_death_stats = high_deaths.get("stats") or {}
+    if high_deaths.get("puuid") != weakest.get("puuid") and high_death_stats.get("deaths", 0) >= 18:
+        recap += (f" {high_deaths.get('name', 'A teammate')} also took {high_death_stats.get('deaths', 0)} trips "
+                  f"back to spawn ({high_death_stats.get('kills', 0)}/{high_death_stats.get('deaths', 0)}/{high_death_stats.get('assists', 0)}); "
+                  "the walk back is basically muscle memory now.")
     events = []
     for item in tracked:
         name = item["p"].get("name", "A queued player")
         for tag in item["tags"]:
             if tag in ("QUAD", "ACE"):
-                events.append(f"{name} landed a {tag.lower()}")
+                events.append(f"{name} landed a {tag.lower()} and immediately became impossible to queue with")
             elif tag == "VICTIM":
-                events.append(f"{name} died in every round")
+                events.append(f"{name} died in every round, a truly committed performance")
     if events:
         recap += " " + "; ".join(events[:2]) + "."
     margin = abs(our_score - their_score)
-    recap += f" The final margin was {margin} round{'s' if margin != 1 else ''}."
+    recap += f" The final margin was {margin} round{'s' if margin != 1 else ''}; the group chat has enough material for the post-game review."
     return recap
 
 
@@ -1341,12 +1369,16 @@ def _play_headline(all_teammates, our_score, their_score):
         return "MATCH RECAP"
     weakest = min(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0))
     strongest = max(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0))
-    if weakest.get("puuid") == strongest.get("puuid"):
-        return f"{our_score}-{their_score} MATCH RECAP"
     stats = weakest.get("stats") or {}
     acs = round(stats.get("score", 0) / max(our_score + their_score, 1))
     name = weakest.get("name", "PLAYER").upper()
-    return f"ROUGHEST LINE: {name} AT {acs} ACS"
+    if weakest.get("puuid") == strongest.get("puuid"):
+        return f"{name} WAS BOTH THE CARRY AND THE CONTENT"
+    if stats.get("deaths", 0) >= 18:
+        return f"{name}'S RESPAWN BUTTON MVP RUN"
+    if acs < 100:
+        return f"{name}'S CROSSHAIR TOOK THE NIGHT OFF"
+    return f"{name}'S LOWEST IMPACT: {acs} ACS"
 
 
 def _deaths_by_round(detail):
@@ -1377,40 +1409,49 @@ async def play_match_image(detail, queued_players, all_teammates, representative
                         path.write_bytes(await response.read())
         except Exception as exc:
             print(f"Map art unavailable for {map_name}: {exc}")
-    try:
-        catalog = await icon_maps()
-        ids_by_name = {name.casefold(): agent_id for agent_id, name in catalog.get("agent_names", {}).items()}
-        icon_jobs = {}
-        agent_names_by_puuid = {}
-        for player in queued_players:
-            agent_obj = player.get("agent") or player.get("character") or {}
-            if isinstance(agent_obj, dict):
-                agent_name = agent_obj.get("name") or agent_obj.get("display_name") or agent_obj.get("displayName") or ""
-                raw_agent_id = agent_obj.get("id") or agent_obj.get("uuid") or ""
-            else:
-                agent_name, raw_agent_id = str(agent_obj), ""
-            agent_id = str(raw_agent_id).lower()
-            if agent_id not in catalog.get("agents", {}):
-                agent_id = ids_by_name.get(agent_name.casefold(), "").lower()
-            icon_urls = catalog.get("agent_icon_urls", {}).get(agent_id) or [catalog.get("agents", {}).get(agent_id)]
-            icon_urls = [url for url in icon_urls if url]
-            if icon_urls and player.get("puuid"):
-                agent_names_by_puuid[player["puuid"]] = agent_name
-                async def fetch_agent_icon(urls=icon_urls):
-                    for url in urls:
-                        image = await icon_img(url, 60)
-                        if image is not None:
-                            return image
-                    return None
-                icon_jobs[player["puuid"]] = fetch_agent_icon()
-        loaded = await asyncio.gather(*icon_jobs.values()) if icon_jobs else []
-        icons_by_puuid = dict(zip(icon_jobs, loaded))
-        missing = [agent_names_by_puuid[puuid] for puuid, icon in icons_by_puuid.items() if icon is None]
-        if missing:
-            print("Agent art unavailable for match card: " + ", ".join(missing))
-    except Exception as exc:
-        print(f"Agent icons unavailable for match card: {exc}")
-        icons_by_puuid = {}
+    raw_agents = [p.get("agent") or p.get("character") or {} for p in queued_players]
+    needs_catalog = any(
+        not ((agent.get("id") or agent.get("uuid")) if isinstance(agent, dict) else "")
+        for agent in raw_agents
+    )
+    catalog = {}
+    if needs_catalog:
+        try:
+            catalog = await icon_maps()
+        except Exception as exc:
+            print(f"Agent catalog unavailable; loading by player agent IDs: {exc}")
+    ids_by_name = {name.casefold(): agent_id for agent_id, name in catalog.get("agent_names", {}).items()}
+    icon_jobs = {}
+    agent_names_by_puuid = {}
+    for player in queued_players:
+        agent_obj = player.get("agent") or player.get("character") or {}
+        if isinstance(agent_obj, dict):
+            agent_name = agent_obj.get("name") or agent_obj.get("display_name") or agent_obj.get("displayName") or ""
+            raw_agent_id = agent_obj.get("id") or agent_obj.get("uuid") or ""
+        else:
+            agent_name, raw_agent_id = str(agent_obj), ""
+        agent_id = str(raw_agent_id).lower()
+        if agent_id not in catalog.get("agents", {}):
+            agent_id = ids_by_name.get(agent_name.casefold(), agent_id)
+        direct_icon_url = f"https://media.valorant-api.com/agents/{agent_id}/displayicon.png" if agent_id else None
+        icon_urls = ([direct_icon_url] if direct_icon_url else [])
+        icon_urls.extend(catalog.get("agent_icon_urls", {}).get(agent_id) or [catalog.get("agents", {}).get(agent_id)])
+        icon_urls = list(dict.fromkeys(url for url in icon_urls if url))
+        puuid = player.get("puuid")
+        if icon_urls and puuid:
+            agent_names_by_puuid[puuid] = agent_name
+            async def fetch_agent_icon(urls=icon_urls):
+                for url in urls:
+                    image = await icon_img(url, 66)
+                    if image is not None:
+                        return image
+                return None
+            icon_jobs[puuid] = fetch_agent_icon()
+    loaded = await asyncio.gather(*icon_jobs.values()) if icon_jobs else []
+    icons_by_puuid = dict(zip(icon_jobs, loaded))
+    missing = [agent_names_by_puuid[puuid] for puuid, icon in icons_by_puuid.items() if icon is None]
+    if missing:
+        print("Agent art unavailable for match card: " + ", ".join(missing))
     # Keep rendering input local; API response objects remain unchanged.
     render_players = [dict(p, _play_icon=icons_by_puuid.get(p.get("puuid"))) for p in queued_players]
     loop = asyncio.get_running_loop()
@@ -1427,19 +1468,19 @@ async def test_play_card(interaction: discord.Interaction):
     now = datetime.now(timezone.utc)
     kevin = {
         "puuid": "test-kevin-puuid", "name": "Kevin", "tag": "TEST", "team_id": "Red",
-        "agent": {"name": "Jett"},
+        "agent": {"id": "dade69b4-4f5a-8528-247b-219e5a1facd6", "name": "Fade"},
         "stats": {"kills": 14, "deaths": 17, "assists": 11, "score": 6963,
                   "headshots": 49, "bodyshots": 106, "legshots": 12},
     }
     spam = {
         "puuid": "test-spam-puuid", "name": "Spam", "tag": "TEST", "team_id": "Red",
-        "agent": {"name": "Chamber"},
+        "agent": {"id": "22697a3d-45bf-8dd7-4fec-84a9e28c69d7", "name": "Chamber"},
         "stats": {"kills": 7, "deaths": 18, "assists": 7, "score": 3927,
                   "headshots": 18, "bodyshots": 74, "legshots": 6},
     }
     blue = {
         "puuid": "test-opponent-puuid", "name": "Opponent", "tag": "TEST", "team_id": "Blue",
-        "agent": {"name": "Sova"},
+        "agent": {"id": "707eab51-4836-f488-046a-cda6bf494859", "name": "Viper"},
         "stats": {"kills": 19, "deaths": 10, "assists": 5, "score": 6540,
                   "headshots": 44, "bodyshots": 83, "legshots": 10},
     }
@@ -1455,7 +1496,7 @@ async def test_play_card(interaction: discord.Interaction):
             kills.append({"round": round_number, "time_in_round_in_ms": 1000 + kill_index * 2500,
                           "killer": {"puuid": player["puuid"]}, "victim": {"puuid": victim["puuid"]}})
     detail = {
-        "metadata": {"map": {"id": "224b0a95-48b9-f703-1bd8-67aca101a6f", "name": "Abyss"},
+        "metadata": {"map": {"id": "224b0a95-48b9-f703-1bd8-67aca101a61f", "name": "Abyss"},
                      "started_at": now.isoformat(), "game_length_in_ms": 44 * 60 * 1000},
         "teams": [
             {"team_id": "Red", "won": False, "rounds": {"won": 8, "lost": 13}, "premier_roster": {"name": "Queue"}},
