@@ -1247,16 +1247,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         death_rounds = sum(1 for events in deaths_by_round.values() if events.get(puuid, 0) > 0)
         if round_count > 0 and death_rounds >= round_count: tags.append("VICTIM")
         if puuid == team_lvp_id: tags.append("LVP")
-        half_kills = [0, 0]
-        half_deaths = [0, 0]
-        for round_number, kill_map in kills_per_round.items():
-            half = 0 if round_number <= 12 else 1
-            half_kills[half] += kill_map.get(puuid, 0)
-        for round_number, events in deaths_by_round.items():
-            half = 0 if round_number <= 12 else 1
-            half_deaths[half] += events.get(puuid, 0)
         tracked.append({"p": p, "st": st, "hs": hs, "tags": tags,
-                        "h1": f"{half_kills[0]}/{half_deaths[0]}", "h2": f"{half_kills[1]}/{half_deaths[1]}",
                         "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0),
                         "adr": damage_by_id.get(puuid, 0)})
 
@@ -1281,7 +1272,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
                 used = 0
             used += tag_width + 6
         max_tag_rows = max(max_tag_rows, tag_rows)
-    card_h = 194 + (max_tag_rows - 1) * 28
+    card_h = 208 + (max_tag_rows - 1) * 28
     rows = max(1, (len(tracked) + columns - 1) // columns)
     cards_top = hero_h + summary_h + 22
     height = cards_top + rows * (card_h + gap) - gap + 26
@@ -1308,7 +1299,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     else:
         date_label = "Time unavailable"
     draw.text((side_pad, 224), f"Competitive · {duration} · {date_label}", font=f_sub, fill=(207, 205, 210), anchor="lm")
-    badge = f"{'Victory' if won else 'Defeat'} {our_score}-{their_score}"
+    badge = f"{our_score}-{their_score}"
     badge_box = (width - side_pad - 208, 186, width - side_pad, 238)
     draw.rounded_rectangle(badge_box, radius=18, fill=accent)
     draw.text(((badge_box[0] + badge_box[2]) // 2, (badge_box[1] + badge_box[3]) // 2), badge,
@@ -1335,7 +1326,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         icon = p.get("_play_icon")
         icon_size = 76
         icon_x, icon_y = x + 18, y + 18
-        draw.rounded_rectangle((icon_x, icon_y, icon_x + icon_size, icon_y + icon_size), radius=8, fill=(43, 42, 47))
+        draw.rounded_rectangle((icon_x, icon_y, icon_x + icon_size, icon_y + icon_size), radius=8, fill=(28, 27, 31))
         if icon:
             icon = ImageOps.contain(icon.convert("RGBA"), (icon_size, icon_size), method=Image.Resampling.LANCZOS)
             fitted_x = icon_x + (icon_size - icon.width) // 2
@@ -1363,7 +1354,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 30), radius=6, fill=tag_colour)
             draw.text((tx + tw / 2, tag_y + 15), tag, font=tag_font, fill=tag_text, anchor="mm")
             tx += tw + 6
-        stat_label_y = y + 104 + tag_row * 32
+        stat_label_y = y + 118 + tag_row * 32
         stat_value_y = stat_label_y + 31
         labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
                   ("ACS", str(round(st.get("score", 0) / round_count))),
@@ -1375,7 +1366,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             draw.text((cx, stat_value_y), value, font=match_font(24, True), fill=(247, 246, 248), anchor="mm")
         subtext_y = stat_value_y + 33
         draw.text(((x + right) // 2, subtext_y),
-                  f"HS {item['hs']}% | H1 {item['h1']} | H2 {item['h2']} | FB {item['fb']} | FD {item['fd']}",
+                  f"HS {item['hs']}% | FB {item['fb']} | FD {item['fd']}",
                   font=match_font(15), fill=(155, 152, 161), anchor="mm")
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
