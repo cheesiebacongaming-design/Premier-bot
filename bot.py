@@ -439,10 +439,10 @@ async def icon_maps():
         )
         agents, tiers = agents_data["data"], tiers_data["data"]
         return {
-            "agents": {a["uuid"].lower(): (a.get("killfeedPortrait") or a.get("bustPortrait") or a.get("displayIcon") or a.get("fullPortrait")) for a in agents},
+            "agents": {a["uuid"].lower(): (a.get("displayIcon") or a.get("bustPortrait") or a.get("killfeedPortrait") or a.get("fullPortrait")) for a in agents},
             "agent_icon_urls": {
                 a["uuid"].lower(): list(dict.fromkeys(
-                    url for url in (a.get("killfeedPortrait"), a.get("bustPortrait"), a.get("displayIcon"), a.get("fullPortrait")) if url
+                    url for url in (a.get("displayIcon"), a.get("bustPortrait"), a.get("killfeedPortrait"), a.get("fullPortrait")) if url
                 )) for a in agents
             },
             "agent_names": {a["uuid"].lower(): a["displayName"] for a in agents},
@@ -450,7 +450,7 @@ async def icon_maps():
         }
 
     try:
-        return await cached("icons:maps4", 7 * 86400, fetch)
+        return await cached("icons:maps5", 7 * 86400, fetch)
     except Exception:
         # Continue using the repository's older cached image catalog if the asset host is down.
         return await cached("icons:maps2", None, fetch)
@@ -1263,9 +1263,9 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     width, hero_h, card_h, gap = 1200, 270, 276, 18
     recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
     headline = _play_headline(all_teammates, our_score, their_score)
-    recap_font = match_font(22, serif=True)
+    recap_font = match_font(23)
     measure_draw = ImageDraw.Draw(Image.new("RGB", (width, 1)))
-    recap_lines = _wrap_image_text(measure_draw, recap, recap_font, width - 64, 7)
+    recap_lines = _wrap_image_text(measure_draw, recap, recap_font, width - 32, 7)
     summary_h = 152 + max(0, len(recap_lines) - 1) * 42
     columns, side_pad, column_gap = 2, 24, 18
     card_width = (width - 2 * side_pad - column_gap) // columns
@@ -1306,9 +1306,9 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     while headline_size > 22 and draw.textlength(headline, font=headline_font) > width - 64:
         headline_size -= 1
         headline_font = match_font(headline_size, True)
-    draw.text((12, hero_h + 44), headline, font=headline_font, fill=coral, anchor="lm")
+    draw.text((16, hero_h + 44), headline, font=headline_font, fill=coral, anchor="lm")
     for line_index, line in enumerate(recap_lines):
-        draw.text((32, hero_h + 100 + line_index * 42), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
+        draw.text((16, hero_h + 100 + line_index * 42), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
     for index, item in enumerate(tracked):
         col, row = index % columns, index // columns
         if len(tracked) % columns and row == rows - 1:
@@ -1322,6 +1322,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         agent_obj = p.get("agent") or p.get("character") or {}
         agent = (agent_obj.get("name") or agent_obj.get("display_name") or agent_obj.get("displayName") or "Agent") if isinstance(agent_obj, dict) else str(agent_obj)
         icon = p.get("_play_icon")
+        draw.rounded_rectangle((x + 20, y + 18, x + 74, y + 72), radius=7, fill=(43, 42, 47))
         if icon:
             icon = ImageOps.contain(icon.convert("RGBA"), (54, 54), method=Image.Resampling.LANCZOS)
             icon_x = x + 20 + (54 - icon.width) // 2
@@ -1560,9 +1561,9 @@ async def play_match_image(detail, queued_players, all_teammates, representative
             agent_id = ids_by_name.get(agent_name.casefold(), agent_id)
         direct_icon_url = f"https://media.valorant-api.com/agents/{agent_id}/displayicon.png" if agent_id else None
         icon_urls = ([
-            f"https://media.valorant-api.com/agents/{agent_id}/killfeedportrait.png",
-            f"https://media.valorant-api.com/agents/{agent_id}/bustportrait.png",
             direct_icon_url,
+            f"https://media.valorant-api.com/agents/{agent_id}/bustportrait.png",
+            f"https://media.valorant-api.com/agents/{agent_id}/killfeedportrait.png",
         ] if direct_icon_url else [])
         icon_urls.extend(catalog.get("agent_icon_urls", {}).get(agent_id) or [catalog.get("agents", {}).get(agent_id)])
         icon_urls = list(dict.fromkeys(url for url in icon_urls if url))
