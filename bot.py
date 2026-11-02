@@ -1260,7 +1260,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
                         "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0),
                         "adr": damage_by_id.get(puuid, 0)})
 
-    width, hero_h, card_h, gap = 1200, 270, 276, 18
+    width, hero_h, gap = 1200, 270, 18
     recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
     headline = _play_headline(all_teammates, our_score, their_score)
     recap_font = match_font(23)
@@ -1269,6 +1269,19 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     recap_lines = _wrap_image_text(measure_draw, recap, recap_font, width - 2 * side_pad, 7)
     summary_h = 152 + max(0, len(recap_lines) - 1) * 42
     card_width = (width - 2 * side_pad - column_gap) // columns
+    tag_font = match_font(14, True)
+    tag_width_limit = card_width - 132
+    max_tag_rows = 1
+    for item in tracked:
+        used, tag_rows = 0, 1
+        for tag in item["tags"]:
+            tag_width = int(measure_draw.textlength(tag, font=tag_font)) + 16
+            if used and used + tag_width > tag_width_limit:
+                tag_rows += 1
+                used = 0
+            used += tag_width + 6
+        max_tag_rows = max(max_tag_rows, tag_rows)
+    card_h = 194 + (max_tag_rows - 1) * 28
     rows = max(1, (len(tracked) + columns - 1) // columns)
     cards_top = hero_h + summary_h + 22
     height = cards_top + rows * (card_h + gap) - gap + 26
@@ -1338,7 +1351,6 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         player_blue = (164, 194, 245)
         draw.text((player_name_x, y + 18), player_name, font=player_name_font, fill=player_blue, anchor="lt")
         tx, tag_row = player_name_x, 0
-        tag_font = match_font(14, True)
         for tag in item["tags"]:
             tw = int(draw.textlength(tag, font=tag_font)) + 16
             max_right = right - 20
@@ -1351,7 +1363,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             draw.rounded_rectangle((tx, tag_y, tx + tw, tag_y + 30), radius=6, fill=tag_colour)
             draw.text((tx + tw / 2, tag_y + 15), tag, font=tag_font, fill=tag_text, anchor="mm")
             tx += tw + 6
-        stat_label_y = y + 130 + tag_row * 32
+        stat_label_y = y + 104 + tag_row * 32
         stat_value_y = stat_label_y + 31
         labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
                   ("ACS", str(round(st.get("score", 0) / round_count))),
@@ -1361,7 +1373,7 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             cx = x + 22 + cell * cell_w + cell_w // 2
             draw.text((cx, stat_label_y), label, font=match_font(16), fill=(154, 151, 160), anchor="mm")
             draw.text((cx, stat_value_y), value, font=match_font(24, True), fill=(247, 246, 248), anchor="mm")
-        subtext_y = y + 222 + tag_row * 28
+        subtext_y = stat_value_y + 33
         draw.text(((x + right) // 2, subtext_y),
                   f"HS {item['hs']}% | H1 {item['h1']} | H2 {item['h2']} | FB {item['fb']} | FD {item['fd']}",
                   font=match_font(15), fill=(155, 152, 161), anchor="mm")
