@@ -42,6 +42,7 @@ PLAYBOOK_FILE = Path("playbooks.json")
 ACCOUNTS_FILE = Path("accounts.json")  # Discord user -> Riot ID
 AGENTS_FILE = Path("agents.json")  # map -> {Discord user -> agent}
 PLAY_SESSIONS_FILE = Path("play_sessions.json")
+MATCHFEEDS_FILE = Path("matchfeeds.json")  # guild -> auto match feed channel/state
 ICON_DIR = Path("icons")
 ICON_DIR.mkdir(exist_ok=True)
 
@@ -53,6 +54,7 @@ class BotClient(discord.Client):
         self.x_session = aiohttp.ClientSession(timeout=timeout)
         self.queue_reminder_task = asyncio.create_task(queue_reminder_loop())
         self.play_session_task = asyncio.create_task(play_session_loop())
+        self.matchfeed_task = asyncio.create_task(matchfeed_loop())
 
     async def close(self):
         for session in (getattr(self, "http_session", None), getattr(self, "x_session", None)):
@@ -1104,6 +1106,17 @@ def save_play_sessions(sessions):
     PLAY_SESSIONS_FILE.write_text(json.dumps(sessions, indent=1))
 
 
+def load_matchfeeds():
+    try:
+        return json.loads(MATCHFEEDS_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_matchfeeds(feeds):
+    MATCHFEEDS_FILE.write_text(json.dumps(feeds, indent=1))
+
+
 @tree.command(name="play", description="Start or stop tracking a Valorant queue session")
 @app_commands.describe(action="Start tracking or stop your active session", players="Optional queued players, as @mentions")
 @app_commands.choices(action=[app_commands.Choice(name="Start", value="start"), app_commands.Choice(name="Stop", value="stop")])
@@ -1136,14 +1149,48 @@ async def play_cmd(interaction: discord.Interaction, action: app_commands.Choice
                                             allowed_mentions=discord.AllowedMentions.none())
 
 
+@tree.command(name="matchfeed", description="Set this server's automatic Valorant match report channel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(channel="Channel for match reports; leave blank to disable")
+async def matchfeed_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not interaction.guild or not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can configure the match feed.", ephemeral=True)
+    feeds = load_matchfeeds()
+    guild_key = str(interaction.guild_id)
+    existing = feeds.get(guild_key) or {}
+    if channel is None:
+        feeds.pop(guild_key, None)
+        save_matchfeeds(feeds)
+        return await interaction.response.send_message("Automatic match reports disabled for this server.", ephemeral=True)
+    if int(existing.get("channel_id", 0)) != channel.id:
+        feeds[guild_key] = {
+            "channel_id": channel.id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "seen": [],
+        }
+    else:
+        existing["channel_id"] = channel.id
+        existing.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+        existing.setdefault("seen", [])
+        feeds[guild_key] = existing
+    save_matchfeeds(feeds)
+    await interaction.response.send_message(
+        f"Automatic match reports will post in {channel.mention} for each new competitive match involving a registered account. Registered players on the same team are combined into one post.",
+        ephemeral=True,
+    )
+
+
 async def play_session_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         sessions = load_play_sessions()
         accounts = load_accounts()
+        matchfeeds = load_matchfeeds()
         dirty = False
         for key, session in list(sessions.items()):
             try:
+                if str(session.get("guild_id")) in matchfeeds:
+                    continue  # the global match feed owns auto-posts for this guild
                 candidates = {}
                 for uid in session.get("players", []):
                     account = accounts.get(str(uid))
@@ -1155,23 +1202,24 @@ async def play_session_loop():
                     for item in data or []:
                         mid = (item.get("meta") or {}).get("id")
                         if mid:
-                            candidates[mid] = item
+                            candidates.setdefault(mid, {"item": item, "region": region})
                 seen = set(session.get("seen", []))
                 fresh = []
-                for mid, item in candidates.items():
+                for mid, candidate in candidates.items():
                     if mid in seen:
                         continue
-                    started = parse_time((item.get("meta") or {}).get("started_at"))
+                    started = parse_time((candidate["item"].get("meta") or {}).get("started_at"))
                     since = parse_time(session.get("started_at"))
                     seen.add(mid)
                     if started and since and started >= since:
-                        fresh.append((mid, started))
+                        fresh.append((mid, started, candidate["region"]))
                 session["seen"] = list(seen)[-100:]
                 session["started_at"] = session.get("started_at") or datetime.now(timezone.utc).isoformat()
                 dirty = True
                 channel = client.get_channel(int(session["channel_id"])) or await client.fetch_channel(int(session["channel_id"]))
-                for mid, _ in sorted(fresh, key=lambda pair: pair[1]):
-                    detail = await cached(f"playscoutmatch:{mid}", None, lambda mid=mid: match_detail(mid))
+                for mid, _, region in sorted(fresh, key=lambda item: item[1]):
+                    detail = await cached(f"matchdetail:{mid}", 30 * 86400,
+                                          lambda mid=mid, region=region: match_detail(mid, region))
                     queue_ids = set(session.get("players", []))
                     participants = detail.get("players", [])
                     # Only announce matches where at least one tracked account played.
@@ -1188,6 +1236,176 @@ async def play_session_loop():
         if dirty:
             save_play_sessions(sessions)
         await asyncio.sleep(300)
+
+
+async def matchfeed_loop():
+    """Poll linked accounts and post once per match when registered players appear."""
+    await client.wait_until_ready()
+    loop = asyncio.get_running_loop()
+    while not client.is_closed():
+        cycle_started = loop.time()
+        feeds = load_matchfeeds()
+        accounts = load_accounts()
+        try:
+            if feeds and accounts:
+                linked = {}
+                for user_id, account in accounts.items():
+                    name, tag = account.get("name"), account.get("tag")
+                    if not name or not tag:
+                        continue
+                    riot_key = f"{name}#{tag}".casefold()
+                    entry = linked.setdefault(riot_key, {"account": account, "user_ids": set()})
+                    entry["user_ids"].add(str(user_id))
+
+                candidates = {}
+                request_count = 0
+                for riot_key, entry in linked.items():
+                    account = entry["account"]
+                    region = account.get("region") or AFFINITY
+                    if request_count:
+                        await asyncio.sleep(2.3)  # leave room under the basic API rate limit
+                    request_count += 1
+                    try:
+                        history = await cached_api(
+                            f"/valorant/v1/stored-matches/{region}/{quote(account['name'])}/{quote(account['tag'])}",
+                            240, mode="competitive", size=10,
+                        )
+                    except Exception as exc:
+                        print(f"Match feed history failed for {account['name']}#{account['tag']}: {exc}")
+                        continue
+                    for item in history or []:
+                        meta = item.get("meta") or {}
+                        match_id = meta.get("id")
+                        started = parse_time(meta.get("started_at"))
+                        if not match_id or not started:
+                            continue
+                        candidate = candidates.setdefault(match_id, {
+                            "started": started, "region": region, "account_keys": set(),
+                        })
+                        candidate["account_keys"].add(riot_key)
+
+                member_cache = {}
+
+                async def guild_member(guild, user_id):
+                    cache_key = (guild.id, user_id)
+                    if cache_key in member_cache:
+                        return member_cache[cache_key]
+                    member = guild.get_member(int(user_id))
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(int(user_id))
+                        except discord.NotFound:
+                            member = None
+                        except discord.HTTPException as exc:
+                            print(f"Could not resolve match feed member {user_id} in {guild.id}: {exc}")
+                            member = None
+                    member_cache[cache_key] = member
+                    return member
+
+                for match_id, candidate in candidates.items():
+                    eligible_feeds = []
+                    for guild_key, feed in feeds.items():
+                        seen = {str(mid) for mid in feed.get("seen", [])}
+                        since = parse_time(feed.get("started_at"))
+                        if str(match_id) not in seen and since and candidate["started"] >= since:
+                            eligible_feeds.append((guild_key, feed))
+                    if not eligible_feeds:
+                        continue
+
+                    await asyncio.sleep(2.3)
+                    try:
+                        detail = await cached(
+                            f"matchdetail:{match_id}", 30 * 86400,
+                            lambda mid=match_id, region=candidate["region"]: match_detail(mid, region),
+                        )
+                    except Exception as exc:
+                        print(f"Match feed detail failed for {match_id}: {exc}")
+                        continue
+
+                    team_groups = {}
+                    for player_data in detail.get("players", []):
+                        riot_key = f"{player_data.get('name', '')}#{player_data.get('tag', '')}".casefold()
+                        if riot_key not in linked or not player_data.get("team_id"):
+                            continue
+                        group = team_groups.setdefault(str(player_data["team_id"]), {
+                            "account_keys": set(), "user_ids": set(), "players": [],
+                        })
+                        group["account_keys"].add(riot_key)
+                        group["user_ids"].update(linked[riot_key]["user_ids"])
+                        group["players"].append(player_data)
+
+                    shared_teams = [
+                        (team_id, group) for team_id, group in team_groups.items()
+                        if group["account_keys"]
+                    ]
+                    team_records = {str(team.get("team_id")): team for team in detail.get("teams", [])}
+                    map_data = (detail.get("metadata") or {}).get("map") or {}
+                    map_name = map_data.get("name", "Unknown") if isinstance(map_data, dict) else str(map_data)
+                    notify_targets = []
+                    for guild_key, feed in eligible_feeds:
+                        if not shared_teams:
+                            feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
+                            save_matchfeeds(feeds)
+                            continue
+                        guild = client.get_guild(int(guild_key))
+                        if guild is None:
+                            continue
+                        channel = client.get_channel(int(feed.get("channel_id", 0)))
+                        if channel is None:
+                            try:
+                                channel = await client.fetch_channel(int(feed["channel_id"]))
+                            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                                print(f"Could not resolve match feed channel for guild {guild_key}: {exc}")
+                                continue
+
+                        guild_groups = []
+                        for team_id, group in shared_teams:
+                            mentions, member_account_keys = [], set()
+                            for riot_key in group["account_keys"]:
+                                for user_id in linked[riot_key]["user_ids"]:
+                                    member = await guild_member(guild, user_id)
+                                    if member:
+                                        member_account_keys.add(riot_key)
+                                        mentions.append(user_id)
+                            if member_account_keys:
+                                guild_groups.append((team_id, group, list(dict.fromkeys(mentions))))
+                        if not guild_groups:
+                            feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
+                            save_matchfeeds(feeds)
+                            continue
+                        guild_groups.sort(key=lambda item: (
+                            len(item[1]["account_keys"]),
+                            bool(team_records.get(item[0], {}).get("won")),
+                        ), reverse=True)
+                        team_id, group, mentions = guild_groups[0]
+                        team_record = team_records.get(team_id, {})
+                        rounds = team_record.get("rounds") or {}
+                        score = f"{rounds.get('won', 0)}-{rounds.get('lost', 0)}"
+                        result_word = "won" if team_record.get("won") else "lost"
+                        all_team_players = [p for p in detail.get("players", []) if str(p.get("team_id")) == team_id]
+                        mention_text = " ".join(f"<@{user_id}>" for user_id in mentions)
+                        notify_targets.append((guild_key, feed, channel, mention_text, team_id, all_team_players, result_word, score))
+
+                    if notify_targets:
+                        cards_by_team = {}
+                        for guild_key, feed, channel, mention_text, team_id, all_team_players, result_word, score in notify_targets:
+                            try:
+                                if team_id not in cards_by_team:
+                                    card = await play_match_image(detail, all_team_players, all_team_players, all_team_players[0])
+                                    cards_by_team[team_id] = card.fp.getvalue()
+                                await channel.send(
+                                    content=f"{mention_text} {result_word} {score} on {map_name}!",
+                                    file=discord.File(io.BytesIO(cards_by_team[team_id]), filename="match.png"),
+                                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                                )
+                            except discord.HTTPException as exc:
+                                print(f"Could not post match feed {match_id} in guild {guild_key}: {exc}")
+                                continue
+                            feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
+                            save_matchfeeds(feeds)
+        except Exception as exc:
+            print(f"Match feed poll failed: {exc}")
+        await asyncio.sleep(max(1, 300 - (loop.time() - cycle_started)))
 
 
 def draw_play_result(detail, queued_players, all_teammates, representative, map_path):
@@ -1367,7 +1585,10 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             tag_colour, tag_text = PLAY_TAG_STYLES.get(tag_key, ((68, 68, 78), (235, 235, 240)))
             tag_y = y + 54 + tag_row * 32
             draw_soft_box(image, (tx, tag_y, tx + tw, tag_y + 30), tag_colour, opacity=222, radius=3)
-            draw.text((tx + tw / 2, tag_y + 15), tag, font=tag_font, fill=tag_text, anchor="mm")
+            text_bbox = tag_font.getbbox(tag, anchor="mm")
+            text_center_offset = (text_bbox[1] + text_bbox[3]) / 2
+            draw.text((tx + tw / 2, tag_y + 15 - text_center_offset),
+                      tag, font=tag_font, fill=tag_text, anchor="mm")
             tx += tw + 6
         stat_label_y = y + 118 + tag_row * 32
         stat_value_y = stat_label_y + 31
