@@ -36,8 +36,8 @@ class Settings:
     rankstates_file: Path
     icon_dir: Path
     font_dir: Path
-    openai_api_key: Optional[str]
-    openai_model: str
+    gemini_api_key: Optional[str]
+    gemini_model: str
 
 
 def load_settings(environ=None) -> Settings:
@@ -87,8 +87,8 @@ def load_settings(environ=None) -> Settings:
         rankstates_file=Path("rankstates.json"),
         icon_dir=Path("icons"),
         font_dir=Path(__file__).resolve().parent / "assets" / "fonts",
-        openai_api_key=(environ.get("OPENAI_API_KEY") or "").strip() or None,
-        openai_model=(environ.get("OPENAI_MODEL") or "gpt-4.1-mini").strip(),
+        gemini_api_key=(environ.get("GEMINI_API_KEY") or "").strip() or None,
+        gemini_model=(environ.get("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip(),
     )
 
 

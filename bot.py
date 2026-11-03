@@ -1296,7 +1296,7 @@ async def play_match_image(detail, queued_players, all_teammates, representative
     # Keep rendering input local; API response objects remain unchanged.
     render_players = [dict(p, _play_icon=icons_by_puuid.get(p.get("puuid"))) for p in queued_players]
     loop = asyncio.get_running_loop()
-    recap = await generate_recap(client.http_session, SETTINGS.openai_api_key, SETTINGS.openai_model,
+    recap = await generate_recap(client.http_session, SETTINGS.gemini_api_key, SETTINGS.gemini_model,
                                  detail, all_teammates, representative)
     buffer = await loop.run_in_executor(None, draw_play_result, detail, render_players, all_teammates, representative, path, recap)
     return discord.File(buffer, filename="match.png")
