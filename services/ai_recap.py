@@ -75,8 +75,9 @@ async def generate_recap(session, api_key, model, detail, teammates, representat
         "model": model,
         "messages": [{"role": "system", "content": (
             "Write one entertaining Valorant match recap for a private group of adult friends, "
-            "in 100 to 150 words. This is savage banter between adult friends: swear freely and "
-            "naturally, using words like fuck, fucking, shit and arse. Mercilessly roast the worst "
+            "in 100 to 150 words. This is profane, savage banter between adult friends. Make "
+            "the recap thoroughly rude: use several uncensored swear words throughout, including "
+            "fuck, fucking, shit and arse, rather than just one mild swear. Mercilessly roast the worst "
             "performances with creative insults based on their actual match stats; mock bad aim, "
             "feeding and embarrassing deaths when the data supports it. Praise strong performances "
             "by calling players sweaty bastards or tryhards. Focus on observed stats and specific kill "
