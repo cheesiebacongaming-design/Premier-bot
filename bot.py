@@ -16,6 +16,8 @@ import discord
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from discord import app_commands
 from config import REGIONS, SETTINGS
+from services.cache import JsonCache
+from services.valorant_api import HenrikDevClient
 
 TOKEN = SETTINGS.discord_token
 HENRIK_KEY = SETTINGS.henrik_api_key
@@ -57,6 +59,7 @@ class BotClient(discord.Client):
         timeout = aiohttp.ClientTimeout(total=15, connect=5)
         self.http_session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300))
         self.x_session = aiohttp.ClientSession(timeout=timeout)
+        api_client.bind_session(self.http_session)
         self.queue_reminder_task = asyncio.create_task(queue_reminder_loop(), name="queue-reminders")
         self.play_session_task = asyncio.create_task(play_session_loop(), name="play-sessions")
         self.matchfeed_task = asyncio.create_task(matchfeed_loop(), name="match-feed")
@@ -79,82 +82,28 @@ class BotClient(discord.Client):
         for session in (getattr(self, "http_session", None), getattr(self, "x_session", None)):
             if session and not session.closed:
                 await session.close()
-        save_task = globals().get("_cache_save_task")
-        if save_task and not save_task.done():
-            await save_task
+        await cache_store.flush_pending()
         await super().close()
 
 
 client = BotClient(intents=intents)
 tree = app_commands.CommandTree(client)
-sem = asyncio.Semaphore(3)  # be gentle with the rate limit
-_cache_locks = {}
+cache_store = JsonCache(CACHE_FILE)
+api_client = HenrikDevClient(BASE, HENRIK_KEY, max_concurrency=3)
 _icon_locks = {}
-_cache_save_task = None
-_cache_generation = 0
 
 
 # ---------- API helpers ----------
 async def api(path: str, **params):
-    async with sem:
-        async with client.http_session.get(
-            BASE + path, headers={"Authorization": HENRIK_KEY}, params=params
-        ) as r:
-            body = await r.json()
-            if r.status != 200:
-                raise RuntimeError(f"API {r.status}: {body.get('errors') or body}")
-            return body["data"]
-
-
-# ---------- Cache (memory + disk) ----------
-try:
-    _cache = json.loads(CACHE_FILE.read_text())
-except (FileNotFoundError, ValueError):
-    _cache = {}
-
-
-
-async def _flush_cache():
-    await asyncio.sleep(0.3)
-    while True:
-        generation = _cache_generation
-        payload = json.dumps(_cache)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, CACHE_FILE.write_text, payload)
-        if generation == _cache_generation:
-            return
-        await asyncio.sleep(0.05)
-
-
-def _schedule_cache_save():
-    global _cache_save_task, _cache_generation
-    _cache_generation += 1
-    if _cache_save_task is None or _cache_save_task.done():
-        _cache_save_task = asyncio.create_task(_flush_cache())
+    return await api_client.get(path, **params)
 
 
 async def cached(key, ttl, fn):
-    """Return a fresh cached value, else call fn(). ttl=None means keep forever.
-    If fn() fails and a stale value exists, the stale value is returned."""
-    lock = _cache_locks.setdefault(key, asyncio.Lock())
-    async with lock:
-        hit = _cache.get(key)
-        now = time.time()
-        if hit and (hit["ttl"] is None or now - hit["t"] < hit["ttl"]):
-            return hit["data"]
-        try:
-            data = await fn()
-        except Exception:
-            if hit:
-                return hit["data"]
-            raise
-        _cache[key] = {"t": time.time(), "ttl": ttl, "data": data}
-        _schedule_cache_save()
-        return data
+    return await cache_store.get(key, ttl, fn)
 
 
 def cached_api(path, ttl, **params):
-    return cached(path + json.dumps(params, sort_keys=True), ttl, lambda: api(path, **params))
+    return cache_store.get(path + json.dumps(params, sort_keys=True), ttl, lambda: api(path, **params))
 
 
 async def x_get(path, **params):
@@ -1018,9 +967,7 @@ async def queue_reminder_loop():
 @app_commands.default_permissions(manage_guild=True)
 async def clearcache(interaction: discord.Interaction):
     # keep permanent match summaries, drop everything that expires
-    for k in [k for k, v in _cache.items() if v["ttl"] is not None]:
-        del _cache[k]
-    _schedule_cache_save()
+    cache_store.clear_expiring()
     await interaction.response.send_message("Cleared. Match summaries stay cached.", ephemeral=True)
 
 
@@ -2478,7 +2425,7 @@ async def scout(
             return None
         try:
             cache_key = f"scoutmatch:{match_id}"
-            hit = _cache.get(cache_key)
+            hit = cache_store.peek(cache_key)
             is_fresh = hit and (hit.get("ttl") is None or time.time() - hit["t"] < hit["ttl"])
             if is_fresh:
                 detail = await cached(cache_key, None, lambda: match_detail(match_id))
