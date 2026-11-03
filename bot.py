@@ -18,6 +18,7 @@ from discord.ext import commands
 from config import REGIONS, SETTINGS
 from commands import install_command_cogs
 from graphics.assets import load_icon_image
+from graphics.help_card import render_help_card
 from graphics.lineup import render_lineup_card
 from graphics.match_card import draw_play_result
 from graphics.player_history import render_player_history
@@ -2131,9 +2132,10 @@ HELP_SECTIONS = [
 
 @tree.command(name="help", description="List all commands")
 async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(title="Premier bot commands", colour=0xFF4655)
+    await interaction.response.defer(ephemeral=True)
     listed = {n for _, names in HELP_SECTIONS for n in names}
     sections = list(HELP_SECTIONS) + [("Other", [c.name for c in tree.get_commands() if c.name not in listed])]
+    content = []
     for title, names in sections:
         lines = []
         for n in names:
@@ -2141,11 +2143,12 @@ async def help_cmd(interaction: discord.Interaction):
             if not cmd:
                 continue
             params = " ".join(f"<{p.display_name}>" if p.required else f"[{p.display_name}]" for p in cmd.parameters)
-            lines.append(f"`/{n}{' ' + params if params else ''}` {cmd.description}")
+            lines.append((f"/{n}{' ' + params if params else ''}", cmd.description))
         if lines:
-            embed.add_field(name=title, value="\n".join(lines)[:1024], inline=False)
-    embed.set_footer(text="<required> [optional]")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+            content.append((title, lines))
+    loop = asyncio.get_running_loop()
+    image = await loop.run_in_executor(None, render_help_card, content)
+    await interaction.followup.send(file=discord.File(image, filename="help.png"), ephemeral=True)
 
 
 @tree.command(name="debug", description="Dump raw API data (to check field names)")

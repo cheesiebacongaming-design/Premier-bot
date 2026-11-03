@@ -3,6 +3,7 @@ from io import BytesIO
 from PIL import Image
 
 from graphics.lineup import render_lineup_card
+from graphics.help_card import render_help_card
 from graphics.match_card import _assign_unique_tags, draw_play_result
 from graphics.player_history import render_player_history
 from graphics.rank_change import draw_rank_change_card
@@ -65,6 +66,17 @@ def test_player_history_renders_grouped_rows_with_missing_icons():
 
     assert width == 1200
     assert height == 248 + 2 * (46 + 106) + 20
+
+
+def test_help_card_grows_to_fit_long_commands_and_descriptions():
+    short = [("Players", [("/rank [member]", "Show rank")])]
+    long = [("Players", [("/rank " + "[option] " * 20, "Long description " * 60)])]
+
+    short_width, short_height = _png_size(render_help_card(short))
+    long_width, long_height = _png_size(render_help_card(long))
+
+    assert short_width == long_width == 1200
+    assert long_height > short_height
 
 
 def test_rank_change_renderer_returns_fixed_size_png_without_icons():
