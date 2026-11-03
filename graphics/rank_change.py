@@ -7,7 +7,8 @@ from PIL import Image, ImageDraw, ImageOps
 from .assets import match_font
 
 
-def draw_rank_change_card(player_name, from_name, to_name, direction, old_icon, new_icon):
+def draw_rank_change_card(player_name, from_name, to_name, direction, old_icon, new_icon,
+                          from_rr=None, to_rr=None, rr_change=None):
     image = Image.new("RGB", (1200, 500), (17, 16, 20))
     draw = ImageDraw.Draw(image)
     accent = (77, 190, 116) if direction == "up" else (224, 86, 99)
@@ -32,9 +33,16 @@ def draw_rank_change_card(player_name, from_name, to_name, direction, old_icon, 
     paste_tier_icon(new_icon, 905)
     draw.text((295, 365), from_name.upper(), font=match_font(27, True), fill=(218, 216, 222), anchor="mm")
     draw.text((905, 365), to_name.upper(), font=match_font(27, True), fill=(250, 249, 251), anchor="mm")
+    draw.text((295, 398), f"{from_rr} RR" if from_rr is not None else "RR unavailable",
+              font=match_font(18), fill=(170, 168, 178), anchor="mm")
+    draw.text((905, 398), f"{to_rr} RR" if to_rr is not None else "RR unavailable",
+              font=match_font(18), fill=(170, 168, 178), anchor="mm")
     # Draw the arrow directly so it does not depend on font glyph coverage.
     draw.line((570, 282, 626, 282), fill=accent, width=6)
     draw.line((611, 266, 627, 282, 611, 298), fill=accent, width=6, joint="curve")
+    change_text = f"{rr_change:+d} RR" if isinstance(rr_change, int) else "RR unavailable"
+    draw.text((600, 325), change_text, font=match_font(17, True), fill=accent, anchor="mm")
+    draw.text((600, 348), "LAST GAME", font=match_font(11), fill=(154, 151, 161), anchor="mm")
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     buffer.seek(0)

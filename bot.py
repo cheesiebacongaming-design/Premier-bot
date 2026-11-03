@@ -1033,9 +1033,7 @@ async def matchfeed_loop():
                         tier_id = int(tier.get("id") or 0)
                         tier_name = tier.get("name") or "Unrated"
                         previous = rank_states.get(riot_key)
-                        if previous is None:
-                            rank_state_updates[riot_key] = {"tier_id": tier_id, "tier_name": tier_name}
-                        elif int(previous.get("tier_id") or 0) != tier_id:
+                        if previous is not None and int(previous.get("tier_id") or 0) != tier_id:
                             rank_changes.append({
                                 "riot_key": riot_key,
                                 "user_ids": sorted(entry["user_ids"]),
@@ -1045,8 +1043,15 @@ async def matchfeed_loop():
                                 "to_id": tier_id,
                                 "to_name": tier_name,
                                 "direction": "up" if tier_id > int(previous.get("tier_id") or 0) else "down",
+                                "from_rr": previous.get("rr"),
+                                "to_rr": current.get("rr"),
+                                "rr_change": current.get("last_change"),
                             })
-                            rank_state_updates[riot_key] = {"tier_id": tier_id, "tier_name": tier_name}
+                        updated_rank = {
+                            "tier_id": tier_id, "tier_name": tier_name, "rr": current.get("rr")
+                        }
+                        if updated_rank != previous:
+                            rank_state_updates[riot_key] = updated_rank
                     except Exception as exc:
                         print(f"Match feed rank check failed for {account['name']}#{account['tag']}: {exc}")
 
@@ -1194,6 +1199,7 @@ async def matchfeed_loop():
                         card = await rank_change_image(
                             event["name"], event["from_id"], event["from_name"],
                             event["to_id"], event["to_name"], event["direction"],
+                            event["from_rr"], event["to_rr"], event["rr_change"],
                         )
                         image_bytes = card.fp.getvalue()
                     except Exception as exc:
@@ -1293,7 +1299,8 @@ async def play_match_image(detail, queued_players, all_teammates, representative
     return discord.File(buffer, filename="match.png")
 
 
-async def rank_change_image(player_name, from_id, from_name, to_id, to_name, direction):
+async def rank_change_image(player_name, from_id, from_name, to_id, to_name, direction,
+                            from_rr=None, to_rr=None, rr_change=None):
     """Build a rank-change card in the same dark, coral-accented style as match cards."""
     try:
         tier_icons = (await icon_maps()).get("tiers", {})
@@ -1306,7 +1313,8 @@ async def rank_change_image(player_name, from_id, from_name, to_id, to_name, dir
     )
     loop = asyncio.get_running_loop()
     buffer = await loop.run_in_executor(
-        None, draw_rank_change_card, player_name, from_name, to_name, direction, old_icon, new_icon
+        None, draw_rank_change_card, player_name, from_name, to_name, direction, old_icon, new_icon,
+        from_rr, to_rr, rr_change
     )
     return discord.File(buffer, filename="rank-change.png")
 
@@ -1379,7 +1387,9 @@ async def test_rank_card(interaction: discord.Interaction, scenario: app_command
         "derank": (18, "Diamond 1", 17, "Platinum 3", "down"),
     }
     from_id, from_name, to_id, to_name, direction = previews[scenario.value]
-    card = await rank_change_image(interaction.user.display_name, from_id, from_name, to_id, to_name, direction)
+    from_rr, to_rr, rr_change = (0, 80, -20) if direction == "down" else (90, 15, 25)
+    card = await rank_change_image(interaction.user.display_name, from_id, from_name, to_id, to_name,
+                                   direction, from_rr, to_rr, rr_change)
     direction_text = "ranked up" if direction == "up" else "deranked"
     await interaction.followup.send(
         content=f"{interaction.user.mention} {direction_text}!", file=card, ephemeral=True
