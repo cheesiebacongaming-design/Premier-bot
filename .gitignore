@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Persistent user and server state; preserve on deployment hosts, keep out of Git.
+accounts.json
+agents.json
+cache.json
+playbooks.json
+queue_schedule.json
+schedule.json
+play_sessions.json
+matchfeeds.json
+rankstates.json
+
+# Downloaded/cached map and agent images.
+icons/
