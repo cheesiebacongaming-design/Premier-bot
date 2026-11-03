@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import io
 import json
-import os
 import random
 import re
 import time
@@ -16,47 +15,67 @@ import aiohttp
 import discord
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from discord import app_commands
-from dotenv import load_dotenv
+from config import REGIONS, SETTINGS
 
-load_dotenv()
-
-TOKEN = os.environ["DISCORD_TOKEN"]
-HENRIK_KEY = os.environ["HENRIK_API_KEY"]
-TEAM_ID = os.getenv("TEAM_ID")  # optional: roster UUID, more reliable than name/tag
-TEAM_NAME = os.getenv("TEAM_NAME", "")
-TEAM_TAG = os.getenv("TEAM_TAG", "")
-REGIONS = ("eu", "na", "ap", "kr", "latam", "br")
-# optional: "name#tag,name#tag" of your players; used to find Premier matches and your side
-ROSTER = [r.strip() for r in os.getenv("ROSTER", "").split(",") if r.strip()]
-AFFINITY = os.getenv("AFFINITY", "eu").lower()  # eu, na, ap, kr, latam, br
-GUILD_ID = os.getenv("GUILD_ID")  # optional: instant slash-command sync in one server
-BASE = "https://api.henrikdev.xyz"
-X_BEARER = os.getenv("X_BEARER_TOKEN")  # optional: read the schedule tweet automatically
-X_USERNAME = os.getenv("X_USERNAME")  # account that posts the Premier schedule (no @)
-X_KEYWORD = os.getenv("X_KEYWORD", "premier").lower()  # tweet must contain this
-CACHE_FILE = Path("cache.json")
-QUEUE_SCHEDULE_FILE = Path("queue_schedule.json")
-SEASON_FILE = Path("season.json")  # edit this each act
-PLAYBOOK_FILE = Path("playbooks.json")
-ACCOUNTS_FILE = Path("accounts.json")  # Discord user -> Riot ID
-AGENTS_FILE = Path("agents.json")  # map -> {Discord user -> agent}
-PLAY_SESSIONS_FILE = Path("play_sessions.json")
-MATCHFEEDS_FILE = Path("matchfeeds.json")  # guild -> auto match feed channel/state
-RANKSTATES_FILE = Path("rankstates.json")  # last observed rank per linked Riot ID
-ICON_DIR = Path("icons")
-ICON_DIR.mkdir(exist_ok=True)
+TOKEN = SETTINGS.discord_token
+HENRIK_KEY = SETTINGS.henrik_api_key
+TEAM_ID = SETTINGS.team_id
+TEAM_NAME = SETTINGS.team_name
+TEAM_TAG = SETTINGS.team_tag
+ROSTER = list(SETTINGS.roster)
+AFFINITY = SETTINGS.affinity
+GUILD_ID = SETTINGS.guild_id
+BASE = SETTINGS.api_base
+X_BEARER = SETTINGS.x_bearer
+X_USERNAME = SETTINGS.x_username
+X_KEYWORD = SETTINGS.x_keyword
+CACHE_FILE = SETTINGS.cache_file
+QUEUE_SCHEDULE_FILE = SETTINGS.queue_schedule_file
+SEASON_FILE = SETTINGS.season_file
+PLAYBOOK_FILE = SETTINGS.playbook_file
+ACCOUNTS_FILE = SETTINGS.accounts_file
+AGENTS_FILE = SETTINGS.agents_file
+PLAY_SESSIONS_FILE = SETTINGS.play_sessions_file
+MATCHFEEDS_FILE = SETTINGS.matchfeeds_file
+RANKSTATES_FILE = SETTINGS.rankstates_file
+ICON_DIR = SETTINGS.icon_dir
 
 intents = discord.Intents.default()
 class BotClient(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._background_tasks_started = False
+        self._background_tasks = []
+        self._commands_synced = False
+        self._icons_warmed = False
+        self._icon_warm_task = None
+
     async def setup_hook(self):
+        if self._background_tasks_started:
+            return
+        ICON_DIR.mkdir(parents=True, exist_ok=True)
         timeout = aiohttp.ClientTimeout(total=15, connect=5)
         self.http_session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300))
         self.x_session = aiohttp.ClientSession(timeout=timeout)
-        self.queue_reminder_task = asyncio.create_task(queue_reminder_loop())
-        self.play_session_task = asyncio.create_task(play_session_loop())
-        self.matchfeed_task = asyncio.create_task(matchfeed_loop())
+        self.queue_reminder_task = asyncio.create_task(queue_reminder_loop(), name="queue-reminders")
+        self.play_session_task = asyncio.create_task(play_session_loop(), name="play-sessions")
+        self.matchfeed_task = asyncio.create_task(matchfeed_loop(), name="match-feed")
+        self._background_tasks = [
+            self.queue_reminder_task,
+            self.play_session_task,
+            self.matchfeed_task,
+        ]
+        self._background_tasks_started = True
 
     async def close(self):
+        tasks = list(self._background_tasks)
+        if self._icon_warm_task is not None:
+            tasks.append(self._icon_warm_task)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for session in (getattr(self, "http_session", None), getattr(self, "x_session", None)):
             if session and not session.closed:
                 await session.close()
@@ -412,7 +431,7 @@ def font(size, bold=False, serif=False):
         return ImageFont.load_default()
 
 
-MATCH_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+MATCH_FONT_DIR = SETTINGS.font_dir
 
 
 def match_font(size, bold=False, serif=False):
@@ -2872,15 +2891,27 @@ async def debug(interaction: discord.Interaction, what: app_commands.Choice[str]
         await interaction.followup.send(str(e))
 
 
+async def warm_icon_cache():
+    try:
+        await icon_maps()
+    except Exception as exc:
+        print(f"Could not warm icon cache: {exc}")
+    else:
+        client._icons_warmed = True
+
+
 @client.event
 async def on_ready():
-    if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
-    else:
-        await tree.sync()
-    asyncio.create_task(icon_maps())  # warm the agent/rank icon cache
+    if not client._commands_synced:
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+        else:
+            await tree.sync()
+        client._commands_synced = True
+    if not client._icons_warmed and (client._icon_warm_task is None or client._icon_warm_task.done()):
+        client._icon_warm_task = asyncio.create_task(warm_icon_cache(), name="warm-icon-cache")
     print(f"Logged in as {client.user}")
     print("Team lookup:", f"ID {TEAM_ID}" if TEAM_ID else f"name {TEAM_NAME}#{TEAM_TAG}")
 
