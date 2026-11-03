@@ -15,7 +15,9 @@ import aiohttp
 import discord
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from discord import app_commands
+from discord.ext import commands
 from config import REGIONS, SETTINGS
+from commands import install_command_cogs
 from services.cache import JsonCache
 from services.match_history import MatchHistoryService
 from services.valorant_api import HenrikDevClient
@@ -45,16 +47,21 @@ RANKSTATES_FILE = SETTINGS.rankstates_file
 ICON_DIR = SETTINGS.icon_dir
 
 intents = discord.Intents.default()
-class BotClient(discord.Client):
+class BotClient(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._background_tasks_started = False
+        self._command_cogs_loaded = False
         self._background_tasks = []
         self._commands_synced = False
         self._icons_warmed = False
         self._icon_warm_task = None
 
     async def setup_hook(self):
+        await super().setup_hook()
+        if not self._command_cogs_loaded:
+            await install_command_cogs(self, tree)
+            self._command_cogs_loaded = True
         if self._background_tasks_started:
             return
         ICON_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,8 +95,8 @@ class BotClient(discord.Client):
         await super().close()
 
 
-client = BotClient(intents=intents)
-tree = app_commands.CommandTree(client)
+client = BotClient(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
+tree = client.tree
 cache_store = JsonCache(CACHE_FILE)
 api_client = HenrikDevClient(BASE, HENRIK_KEY, max_concurrency=3)
 _icon_locks = {}
