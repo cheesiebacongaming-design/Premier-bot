@@ -29,6 +29,8 @@ files. Configure automatic reports with `/matchfeed` in the target server.
 | --- | --- |
 | `DISCORD_TOKEN` | Required Discord bot token |
 | `HENRIK_API_KEY` | Required HenrikDev API key |
+| `OPENAI_API_KEY` | Optional OpenAI API key for AI match recaps; usage is billed separately |
+| `OPENAI_MODEL` | Optional recap model; defaults to `gpt-4.1-mini` |
 | `TEAM_ID` | Preferred Premier team identifier |
 | `TEAM_NAME`, `TEAM_TAG` | Team lookup when no ID is configured |
 | `ROSTER` | Optional comma-separated `Name#Tag` entries for history fallback |
@@ -39,6 +41,8 @@ files. Configure automatic reports with `/matchfeed` in the target server.
 
 Keep `.env` private. The older `env.example` is retained for existing installs.
 No Discord or API credentials are required by the unit tests.
+When AI recaps are enabled, player names, match statistics, and kill events are
+sent to OpenAI. If no key is set or a request fails, a local recap is used.
 
 ## Deployment on Ubuntu / AWS
 

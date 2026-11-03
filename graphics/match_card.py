@@ -9,7 +9,7 @@ from utils.formatting import parse_time
 from utils.match_summary import _clutch_wins, _deaths_by_round, _play_headline, _play_recap
 
 
-def draw_play_result(detail, queued_players, all_teammates, representative, map_path):
+def draw_play_result(detail, queued_players, all_teammates, representative, map_path, ai_recap=None):
     meta = detail.get("metadata", {})
     teams = {t.get("team_id"): t for t in detail.get("teams", [])}
     team = teams.get(representative.get("team_id"), {})
@@ -86,12 +86,12 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
                         "adr": damage_by_id.get(puuid, 0)})
 
     width, hero_h, gap = 1200, 270, 18
-    recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
+    recap = ai_recap or _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration, detail)
     headline = _play_headline(all_teammates, our_score, their_score)
     recap_font = match_font(23)
     measure_draw = ImageDraw.Draw(Image.new("RGB", (width, 1)))
     columns, side_pad, column_gap = 2, 24, 18
-    recap_lines = wrap_image_text(measure_draw, recap, recap_font, width - 2 * side_pad, 7)
+    recap_lines = wrap_image_text(measure_draw, recap, recap_font, width - 2 * side_pad, 20)
     summary_h = 114 + max(0, len(recap_lines) - 1) * 42
     card_width = (width - 2 * side_pad - column_gap) // columns
     tag_font = match_font(14, True)

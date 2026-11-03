@@ -1,7 +1,7 @@
 import random
 
 
-def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration):
+def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration, detail=None):
     result = "snatched the win" if won else "took the L"
     recap = f"Your queue {result} on {map_name} after {duration} of competitive Valorant, {our_score}-{their_score}."
     if not all_teammates:
@@ -12,31 +12,28 @@ def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, d
     strongest_name = strongest.get("name", "A teammate")
     top_acs = round(top_stats.get("score", 0) / max(our_score + their_score, 1))
     top_kd = top_stats.get("kills", 0) / max(top_stats.get("deaths", 0), 1)
-    top_title = "the team's certified tryhard" if top_acs >= 220 or top_kd >= 1.2 else "the designated carry"
-    recap += (f" {strongest_name} clocked in as {top_title}, topping the team with {top_acs} ACS, "
+    top_title = "sweaty bastard" if top_acs >= 220 or top_kd >= 1.2 else "designated tryhard"
+    recap += (f" {strongest_name} was the {top_title}, topping the team with {top_acs} ACS, "
               f"{top_stats.get('kills', 0)}/{top_stats.get('deaths', 0)}/{top_stats.get('assists', 0)} "
-              f"and a {top_kd:.2f} KD. Someone's definitely watching the VOD back tonight.")
+              f"and a {top_kd:.2f} KD.")
     if strongest.get("puuid") != weakest.get("puuid"):
         low_name = weakest.get("name", "a teammate")
         low_acs = round(low_stats.get("score", 0) / max(our_score + their_score, 1))
         low_kd = low_stats.get("kills", 0) / max(low_stats.get("deaths", 0), 1)
         if low_stats.get("deaths", 0) >= 18:
-            roast = random.choice(("the respawn screen got more quality time than the team", "collected deaths like loyalty stamps", "the enemy team learned their route to spawn by heart"))
+            roast = random.choice(("spent the whole damn match sightseeing in spawn", "fed so hard the enemy should send a thank-you card", "turned dying into a full-time fucking job"))
         elif low_acs < 100:
-            roast = random.choice(("their crosshair was apparently sightseeing", "their aim took an unscheduled lunch break", "the bullets were social distancing"))
+            roast = random.choice(("couldn't hit shit if the target stood still", "apparently brought a fucking water pistol", "their crosshair was on holiday and their aim was in hell"))
         elif low_kd < 0.6:
-            roast = random.choice(("the kill feed was not their biggest fan", "their KD ratio needs a pep talk", "the duels were a generous donation program"))
+            roast = random.choice(("got their arse kicked in practically every duel", "donated kills like a fucking charity", "made the enemy look like a professional team"))
         else:
-            roast = random.choice(("it was a character-building shift", "the scoreboard has chosen violence", "one to quietly blame on the warm-up"))
+            roast = random.choice(("the scoreboard called and it wants an apology", "that was a pretty shit shift", "even the bots are talking trash about that performance"))
         recap += (f" {low_name} had the roughest shift: {low_acs} ACS and "
                   f"{low_stats.get('kills', 0)}/{low_stats.get('deaths', 0)}/{low_stats.get('assists', 0)} "
                   f"({low_kd:.2f} KD); {roast}.")
-    high_deaths = max(all_teammates, key=lambda p: (p.get("stats") or {}).get("deaths", 0))
-    high_death_stats = high_deaths.get("stats") or {}
-    if high_deaths.get("puuid") != weakest.get("puuid") and high_death_stats.get("deaths", 0) >= 18:
-        recap += (f" {high_deaths.get('name', 'A teammate')} also took {high_death_stats.get('deaths', 0)} trips "
-                  f"back to spawn ({high_death_stats.get('kills', 0)}/{high_death_stats.get('deaths', 0)}/{high_death_stats.get('assists', 0)}); "
-                  "the walk back is basically muscle memory now.")
+    highlights = _round_highlights(detail or {}, all_teammates, weakest)
+    if highlights:
+        recap += " " + " ".join(highlights)
     events = []
     for item in tracked:
         name = item["p"].get("name", "A queued player")
@@ -57,11 +54,59 @@ def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, d
                 events.append(f"{name} only went down {item['st'].get('deaths', 0)} times and stayed out of the respawn queue")
             elif tag.startswith("CLUTCH"):
                 events.append(f"{name} won {tag.rsplit('x', 1)[-1]} clutch round(s) and will mention it all week")
-    if events:
+    if events and not highlights:
         recap += " " + "; ".join(events[:2]) + "."
-    margin = abs(our_score - their_score)
-    recap += f" The final margin was {margin} round{'s' if margin != 1 else ''}; the group chat has enough material for the post-game review."
     return recap
+
+
+def _round_highlights(detail, teammates, weakest):
+    """Describe observed kill events without inventing unavailable match details."""
+    kills = [event for event in (detail.get("kills") or [])
+             if isinstance(event.get("round"), int) and event.get("round") >= 0]
+    if not kills:
+        return []
+    by_id = {player.get("puuid"): player for player in teammates if player.get("puuid")}
+    round_offset = 1 if any(event["round"] == 0 for event in kills) else 0
+    grouped = {}
+    for event in kills:
+        killer = (event.get("killer") or {}).get("puuid")
+        if killer in by_id:
+            key = (event["round"], killer)
+            grouped[key] = grouped.get(key, 0) + 1
+    highlights = []
+    if grouped:
+        (round_number, killer), count = max(grouped.items(), key=lambda item: item[1])
+        if count >= 3:
+            name = by_id[killer].get("name", "A teammate")
+            highlights.append(f"In round {round_number + round_offset}, {name} dropped {count} kills; "
+                              "the sweaty bastard will never shut up about it.")
+    first_by_round = {}
+    for event in kills:
+        timestamp = event.get("time_in_round_in_ms")
+        if not isinstance(timestamp, (int, float)):
+            continue
+        old = first_by_round.get(event["round"])
+        if old is None or timestamp < old["time_in_round_in_ms"]:
+            first_by_round[event["round"]] = event
+    victim_id = weakest.get("puuid")
+    early_deaths = [number for number, event in first_by_round.items()
+                    if victim_id and (event.get("victim") or {}).get("puuid") == victim_id]
+    if early_deaths:
+        number = min(early_deaths) + round_offset
+        name = weakest.get("name", "A teammate")
+        highlights.append(f"{name} donated first blood {len(early_deaths)} time(s), including round {number}; "
+                          "apparently waiting for the team was too fucking complicated.")
+    if not highlights and first_by_round:
+        counts = {}
+        for event in first_by_round.values():
+            killer = (event.get("killer") or {}).get("puuid")
+            if killer in by_id:
+                counts[killer] = counts.get(killer, 0) + 1
+        if counts:
+            killer = max(counts, key=counts.get)
+            highlights.append(f"{by_id[killer].get('name', 'A teammate')} opened {counts[killer]} rounds "
+                              "with first blood while the rest found their damn keyboards.")
+    return highlights
 
 
 def _play_headline(all_teammates, our_score, their_score):
