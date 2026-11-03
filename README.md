@@ -30,7 +30,7 @@ files. Configure automatic reports with `/matchfeed` in the target server.
 | `DISCORD_TOKEN` | Required Discord bot token |
 | `HENRIK_API_KEY` | Required HenrikDev API key |
 | `GEMINI_API_KEY` | Optional Google Gemini API key for AI match recaps |
-| `GEMINI_MODEL` | Optional recap model; defaults to `gemini-2.5-flash-lite` |
+| `GEMINI_MODEL` | Optional recap model; defaults to `gemini-3.5-flash-lite` |
 | `TEAM_ID` | Preferred Premier team identifier |
 | `TEAM_NAME`, `TEAM_TAG` | Team lookup when no ID is configured |
 | `ROSTER` | Optional comma-separated `Name#Tag` entries for history fallback |

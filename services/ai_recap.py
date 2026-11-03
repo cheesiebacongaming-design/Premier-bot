@@ -53,7 +53,7 @@ async def generate_recap(session, api_key, model, detail, teammates, representat
         "contents": [{"role": "user", "parts": [{"text": json.dumps(
             recap_facts(detail, teammates, representative), ensure_ascii=False
         )}]}],
-        "generationConfig": {"maxOutputTokens": 600, "thinkingConfig": {"thinkingBudget": 0}},
+        "generationConfig": {"maxOutputTokens": 1024},
     }
     try:
         async with session.post(

@@ -35,11 +35,11 @@ async def test_gemini_recap_uses_match_facts_and_extracts_text():
     player = {"puuid": "p1", "name": "Player", "team_id": "Red", "stats": {"kills": 12}}
     detail = {"players": [player], "metadata": {"map": {"name": "Ascent"}}, "teams": [], "kills": []}
 
-    result = await generate_recap(session, "test-key", "gemini-2.5-flash-lite", detail, [player], player)
+    result = await generate_recap(session, "test-key", "gemini-3.5-flash-lite", detail, [player], player)
 
     assert result == "A match recap."
     url, request = session.request
-    assert url.endswith("/gemini-2.5-flash-lite:generateContent")
+    assert url.endswith("/gemini-3.5-flash-lite:generateContent")
     assert request["headers"]["x-goog-api-key"] == "test-key"
     assert "Ascent" in request["json"]["contents"][0]["parts"][0]["text"]
 
