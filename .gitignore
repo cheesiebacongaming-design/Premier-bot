@@ -10,6 +10,7 @@ venv/
 accounts.json
 agents.json
 cache.json
+.cache.json.*.tmp
 playbooks.json
 queue_schedule.json
 schedule.json
