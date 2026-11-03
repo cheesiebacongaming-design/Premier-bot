@@ -86,8 +86,8 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
                         "adr": damage_by_id.get(puuid, 0)})
 
     width, hero_h, gap = 1200, 270, 18
-    recap = ai_recap or _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration, detail)
-    headline = _play_headline(all_teammates, our_score, their_score)
+    recap = (ai_recap or {}).get("recap") or _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration, detail)
+    headline = ((ai_recap or {}).get("headline") or _play_headline(all_teammates, our_score, their_score)).upper()
     recap_font = match_font(23)
     measure_draw = ImageDraw.Draw(Image.new("RGB", (width, 1)))
     columns, side_pad, column_gap = 2, 24, 18
@@ -144,6 +144,10 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     while headline_size > 22 and draw.textlength(headline, font=headline_font) > width - 64:
         headline_size -= 1
         headline_font = match_font(headline_size, True)
+    if draw.textlength(headline, font=headline_font) > width - 64:
+        while headline and draw.textlength(headline + "...", font=headline_font) > width - 64:
+            headline = headline[:-1]
+        headline = headline.rstrip() + "..."
     draw.text((side_pad, hero_h + 44), headline, font=headline_font, fill=coral, anchor="lm")
     for line_index, line in enumerate(recap_lines):
         draw.text((side_pad, hero_h + 100 + line_index * 42), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
