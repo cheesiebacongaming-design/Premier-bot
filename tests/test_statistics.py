@@ -44,7 +44,7 @@ def _match_detail():
 
 
 def test_summary_identifies_linked_player_side_and_keeps_full_teams():
-    summary = summarise_match(_match_detail(), {"RED-3"})
+    summary = summarise_match(_match_detail(), {"red-3"})
 
     assert summary["map"] == "Ascent"
     assert summary["score"] == "8-13"
