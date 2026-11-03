@@ -88,7 +88,7 @@ def load_settings(environ=None) -> Settings:
         icon_dir=Path("icons"),
         font_dir=Path(__file__).resolve().parent / "assets" / "fonts",
         gemini_api_key=(environ.get("GEMINI_API_KEY") or "").strip() or None,
-        gemini_model=(environ.get("GEMINI_MODEL") or "gemini-3.5-flash-lite").strip(),
+        gemini_model=(environ.get("GEMINI_MODEL") or "gemini-3.8-flash").strip(),
     )
 
 

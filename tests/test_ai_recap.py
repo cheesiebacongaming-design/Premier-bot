@@ -35,11 +35,11 @@ async def test_gemini_recap_uses_match_facts_and_extracts_text():
     player = {"puuid": "p1", "name": "Player", "team_id": "Red", "stats": {"kills": 12}}
     detail = {"players": [player], "metadata": {"map": {"name": "Ascent"}}, "teams": [], "kills": []}
 
-    result = await generate_recap(session, "test-key", "gemini-3.5-flash-lite", detail, [player], player)
+    result = await generate_recap(session, "test-key", "gemini-3.8-flash", detail, [player], player)
 
     assert result == {"headline": "A wild match", "recap": "A match recap."}
     url, request = session.request
-    assert url.endswith("/gemini-3.5-flash-lite:generateContent")
+    assert url.endswith("/gemini-3.8-flash:generateContent")
     assert request["headers"]["x-goog-api-key"] == "test-key"
     assert "Ascent" in request["json"]["contents"][0]["parts"][0]["text"]
 
@@ -59,6 +59,27 @@ async def test_invalid_generated_fields_fall_back():
         "content": {"parts": [{"text": '{"headline":"", "recap":"Some recap."}'}]}}]}))
 
     assert await generate_recap(session, "test-key", "model", {}, [], {}) is None
+
+
+@pytest.mark.asyncio
+async def test_transient_server_error_retries_and_returns_recap(monkeypatch):
+    responses = iter([
+        FakeResponse(503, {}),
+        FakeResponse(200, {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+            {"text": '{"headline":"Match headline", "recap":"Match recap."}'}]}}]}),
+    ])
+
+    class RetryingSession:
+        def post(self, *args, **kwargs):
+            return next(responses)
+
+    async def skip_sleep(seconds):
+        assert seconds == 1
+
+    monkeypatch.setattr("services.ai_recap.asyncio.sleep", skip_sleep)
+    assert await generate_recap(RetryingSession(), "key", "model", {}, [], {}) == {
+        "headline": "Match headline", "recap": "Match recap."
+    }
 
 
 def test_match_and_round_times_are_converted_to_seconds():

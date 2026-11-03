@@ -68,24 +68,9 @@ async def generate_recap(session, api_key, model, detail, teammates, representat
                                  "required": ["headline", "recap"]}},
     }
     try:
-        async with session.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}:generateContent",
-            json=payload, headers={"x-goog-api-key": api_key},
-            timeout=aiohttp.ClientTimeout(total=25, connect=5),
-        ) as response:
-            if response.status != 200:
-                try:
-                    error = (await response.json(content_type=None)).get("error") or {}
-                    code = error.get("status")
-                except (aiohttp.ClientError, ValueError, TypeError, AttributeError):
-                    code = None
-                known_codes = {"RESOURCE_EXHAUSTED", "PERMISSION_DENIED", "UNAUTHENTICATED",
-                               "INVALID_ARGUMENT", "NOT_FOUND", "UNAVAILABLE"}
-                reason = code if isinstance(code, str) and code in known_codes else "unknown"
-                logger.warning("AI recap request failed with HTTP %s (code: %s); using local recap",
-                               response.status, reason)
-                return None
-            data = await response.json()
+        data = await _request_gemini(session, api_key, model, payload)
+        if data is None:
+            return None
         candidates = data.get("candidates") or []
         candidate = candidates[0] if candidates else {}
         if candidate.get("finishReason") != "STOP":
@@ -108,3 +93,34 @@ async def generate_recap(session, api_key, model, detail, teammates, representat
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError):
         logger.warning("AI recap unavailable; using local recap", exc_info=True)
         return None
+
+
+async def _request_gemini(session, api_key, model, payload):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}:generateContent"
+    for attempt in range(2):
+        try:
+            async with session.post(url, json=payload, headers={"x-goog-api-key": api_key},
+                                    timeout=aiohttp.ClientTimeout(total=25, connect=5)) as response:
+                if response.status == 200:
+                    return await response.json()
+                if response.status in (500, 502, 503, 504) and attempt == 0:
+                    logger.warning("AI recap received HTTP %s; retrying once", response.status)
+                else:
+                    try:
+                        error = (await response.json(content_type=None)).get("error") or {}
+                        code = error.get("status")
+                    except (aiohttp.ClientError, ValueError, TypeError, AttributeError):
+                        code = None
+                    known_codes = {"RESOURCE_EXHAUSTED", "PERMISSION_DENIED", "UNAUTHENTICATED",
+                                   "INVALID_ARGUMENT", "NOT_FOUND", "UNAVAILABLE"}
+                    reason = code if isinstance(code, str) and code in known_codes else "unknown"
+                    logger.warning("AI recap request failed with HTTP %s (code: %s); using local recap",
+                                   response.status, reason)
+                    return None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt:
+                logger.warning("AI recap connection failed after retry; using local recap", exc_info=True)
+                return None
+            logger.warning("AI recap connection timed out or failed; retrying once")
+        await asyncio.sleep(1)
+    return None
