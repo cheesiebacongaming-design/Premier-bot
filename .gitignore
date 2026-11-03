@@ -5,6 +5,10 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Persistent user and server state; preserve on deployment hosts, keep out of Git.
 accounts.json
