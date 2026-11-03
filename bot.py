@@ -1220,7 +1220,7 @@ async def matchfeed_loop():
                         mention_text = " ".join(f"<@{user_id}>" for user_id in matching_users)
                         try:
                             await channel.send(
-                                content=f"{mention_text} {direction_text}: **{event['from_name']} → {event['to_name']}**!",
+                                content=f"{mention_text} {direction_text}!",
                                 file=discord.File(io.BytesIO(image_bytes), filename="rank-change.png"),
                                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                             )
@@ -1380,7 +1380,10 @@ async def test_rank_card(interaction: discord.Interaction, scenario: app_command
     }
     from_id, from_name, to_id, to_name, direction = previews[scenario.value]
     card = await rank_change_image(interaction.user.display_name, from_id, from_name, to_id, to_name, direction)
-    await interaction.followup.send(file=card, ephemeral=True)
+    direction_text = "ranked up" if direction == "up" else "deranked"
+    await interaction.followup.send(
+        content=f"{interaction.user.mention} {direction_text}!", file=card, ephemeral=True
+    )
 
 
 @tree.command(name="recent", description="Show a player's most recent competitive match card")
