@@ -3,7 +3,6 @@ from copy import deepcopy
 import hashlib
 import io
 import json
-import random
 import re
 import time
 from pathlib import Path
@@ -14,15 +13,21 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 import discord
-from PIL import Image, ImageDraw, ImageFont, ImageOps
 from discord import app_commands
 from discord.ext import commands
 from config import REGIONS, SETTINGS
 from commands import install_command_cogs
+from graphics.assets import load_icon_image
+from graphics.lineup import render_lineup_card
+from graphics.match_card import draw_play_result
+from graphics.rank_change import draw_rank_change_card
+from graphics.schedule import render_schedule_card
+from graphics.scoreboard import draw_scoreboard
 from services.cache import JsonCache
 from services.json_store import JsonStoreError, read_json, write_json
 from services.match_history import MatchHistoryService
 from services.valorant_api import HenrikDevClient
+from utils.formatting import fmt_range, parse_time
 from utils.statistics import summarise_match
 
 TOKEN = SETTINGS.discord_token
@@ -152,15 +157,6 @@ async def latest_schedule_tweet():
     return await cached("x:latest", 1800, fetch)
 
 
-def parse_time(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
 def ts(d, style="F"):
     if isinstance(d, str):
         d = parse_time(d)
@@ -209,63 +205,7 @@ def player_table(rows):
 
 
 # ---------- Scoreboard image ----------
-FONT_REG = ["segoeui.ttf", "arial.ttf", "DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"]
-FONT_BOLD = ["segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf",
-             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"]
-FONT_SERIF = ["Georgia.ttf", "DejaVuSerif.ttf",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-              "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf"]
-FONT_SERIF_BOLD = ["Georgia Bold.ttf", "DejaVuSerif-Bold.ttf",
-                   "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-                   "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf"]
-
-
-def font(size, bold=False, serif=False):
-    candidates = (FONT_SERIF_BOLD if bold else FONT_SERIF) if serif else (FONT_BOLD if bold else FONT_REG)
-    for name in candidates:
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            continue
-    try:
-        return ImageFont.load_default(size)
-    except TypeError:
-        return ImageFont.load_default()
-
-
-MATCH_FONT_DIR = SETTINGS.font_dir
-
-
-def match_font(size, bold=False, serif=False):
-    """Use bundled match-card fonts so Windows and Linux produce the same image."""
-    name = ("Lora-Bold.ttf" if bold else "Lora-Regular.ttf") if serif else (
-        "Roboto-Bold.ttf" if bold else "Roboto-Regular.ttf"
-    )
-    path = MATCH_FONT_DIR / name
-    try:
-        return ImageFont.truetype(str(path), size)
-    except OSError:
-        return font(size, bold=bold, serif=serif)
-
-
-def draw_soft_box(image, box, fill, opacity=224, radius=4):
-    """Draw a lightly transparent, compact chip on an existing RGB image."""
-    left, top, right, bottom = box
-    width, height = right - left, bottom - top
-    scale = 4
-    layer = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
-    ImageDraw.Draw(layer).rounded_rectangle(
-        (0, 0, width * scale - 1, height * scale - 1),
-        radius=radius * scale,
-        fill=(*fill, opacity),
-    )
-    layer = layer.resize((width, height), Image.Resampling.LANCZOS)
-    base = image.crop((left, top, right, bottom)).convert("RGBA")
-    base.alpha_composite(layer)
-    image.paste(base.convert("RGB"), (left, top))
+# ---------- External image assets ----------
 
 
 async def icon_maps():
@@ -311,11 +251,8 @@ async def icon_img(url, size):
                     if r.status != 200:
                         return None
                     path.write_bytes(await r.read())
-        source = Image.open(path).convert("RGBA")
-        fitted = ImageOps.contain(source, (size, size), method=Image.Resampling.LANCZOS)
-        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        canvas.alpha_composite(fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2))
-        return canvas
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, load_icon_image, path, size)
     except Exception:
         return None
 
@@ -336,61 +273,6 @@ PLAY_TAG_STYLES = {
     "SURVIVOR": ((48, 98, 63), (170, 237, 178)),
     "CLUTCH": ((123, 55, 92), (255, 172, 218)),
 }
-
-
-def draw_scoreboard(s, icons):
-    W, ROW, HEAD, TEAMHEAD, GAP = 1000, 44, 96, 34, 12
-    n = len(s["rows"]) + len(s["enemy_rows"])
-    H = HEAD + 2 * TEAMHEAD + n * ROW + 2 * GAP + 8
-    img = Image.new("RGB", (W, H), (15, 25, 35))
-    d = ImageDraw.Draw(img)
-    accent = (46, 204, 113) if s["won"] else (231, 76, 60)
-
-    d.rectangle([0, 0, W, 6], fill=accent)
-    d.text((24, 48), "VICTORY" if s["won"] else "DEFEAT", font=font(30, True), fill=accent, anchor="lm")
-    d.text((W // 2, 46), f"{s['rw']} : {s['rl']}", font=font(42, True), fill=WHITE, anchor="mm")
-    started = parse_time(s.get("started"))
-    sub = s["map"] + (started.astimezone(timezone.utc).strftime("  \u2022  %d %b %Y %H:%M UTC") if started else "")
-    d.text((W - 24, 48), sub, font=font(18), fill=(190, 200, 210), anchor="rm")
-
-    f_name, f_tag, f_val, f_lab = font(17, True), font(13), font(16), font(13, True)
-    y = HEAD
-    for label, rows, tint in ((s["us"], s["rows"], (52, 152, 219)), (s["them"], s["enemy_rows"], (231, 76, 60))):
-        d.rectangle([0, y, W, y + TEAMHEAD], fill=(30, 42, 56))
-        d.rectangle([0, y, 5, y + TEAMHEAD], fill=tint)
-        d.text((24, y + TEAMHEAD // 2), label, font=font(17, True), fill=WHITE, anchor="lm")
-        d.text((425, y + TEAMHEAD // 2), "RANK", font=f_lab, fill=GREY, anchor="mm")
-        for name, x in COLS:
-            d.text((x, y + TEAMHEAD // 2), name, font=f_lab, fill=GREY, anchor="mm")
-        y += TEAMHEAD
-        for i, r in enumerate(rows):
-            if i % 2 == 0:
-                d.rectangle([0, y, W, y + ROW], fill=(20, 32, 45))
-            cy = y + ROW // 2
-            ic = icons.get(("a", r["agent_id"]))
-            if ic:
-                img.paste(ic, (24, cy - 18), ic)
-            else:
-                d.text((42, cy), r["agent"][:3], font=f_lab, fill=GREY, anchor="mm")
-            d.text((70, cy), r["name"], font=f_name, fill=WHITE, anchor="lm")
-            d.text((70 + d.textlength(r["name"], font=f_name) + 6, cy), f"#{r['tag']}", font=f_tag, fill=GREY, anchor="lm")
-            tic = icons.get(("t", r["tier"]))
-            if tic:
-                img.paste(tic, (425 - 15, cy - 15), tic)
-            else:
-                d.text((425, cy), "-", font=f_val, fill=GREY, anchor="mm")
-            diff = r["k"] - r["d"]
-            vals = [r["acs"], r["k"], r["d"], r["a"], f"{diff:+d}", f"{r['k'] / max(r['d'], 1):.2f}", r["adr"], f"{r['hs']}%", r.get("fb", 0)]
-            for (name, x), v in zip(COLS, vals):
-                colour = (46, 204, 113) if name == "+/-" and diff > 0 else (231, 76, 60) if name == "+/-" and diff < 0 else WHITE
-                d.text((x, cy), str(v), font=f_val, fill=colour, anchor="mm")
-            y += ROW
-        y += GAP
-
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    buf.seek(0)
-    return buf
 
 
 async def current_rank(name, tag):
@@ -460,14 +342,6 @@ def season_maps():
     return [w["map"] for w in season["weeks"] if "Playoffs" not in w["map"]] if season else []
 
 
-def fmt_range(start, end):
-    a = datetime.fromisoformat(start)
-    b = datetime.fromisoformat(end)
-    if a == b:
-        return f"{a:%b} {a.day}"
-    return f"{a:%b} {a.day}\u2013{b.day}" if a.month == b.month else f"{a:%b} {a.day} \u2013 {b:%b} {b.day}"
-
-
 async def valorant_map_catalog():
     async def fetch():
         async with client.http_session.get("https://valorant-api.com/v1/maps") as response:
@@ -496,69 +370,6 @@ async def map_background_path(map_uuid, map_name="Unknown"):
     return path if path.exists() else None
 
 
-def draw_schedule_card(season, map_art, today):
-    weeks = season.get("weeks", [])
-    width, margin, row_gap, row_height = 1200, 28, 8, 118
-    header_height = 128
-    note = (season.get("note") or "").strip()
-    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    note_font = match_font(23, True)
-    note_lines = _wrap_image_text(measure, note, note_font, width - margin * 2, 2) if note else []
-    footer_height = 46 + len(note_lines) * 31 if note_lines else 20
-    height = header_height + len(weeks) * (row_height + row_gap) + footer_height + 20
-    image = Image.new("RGB", (width, height), (17, 16, 20))
-    draw = ImageDraw.Draw(image)
-    coral = (241, 94, 106)
-    draw.rectangle((0, 0, width, 7), fill=coral)
-    stage = season.get("stage", "Premier")
-    draw.text((margin, 56), "PREMIER SCHEDULE", font=match_font(38, True), fill=(249, 248, 250), anchor="lm")
-    draw.text((width - margin, 58), stage.upper(), font=match_font(21, True), fill=(168, 165, 174), anchor="rm")
-    draw.line((margin, 104, width - margin, 104), fill=(58, 56, 64), width=2)
-
-    marked = False
-    for index, week in enumerate(weeks):
-        y = header_height + index * (row_height + row_gap)
-        start, end = week.get("start", ""), week.get("end", "")
-        if end and end < today:
-            status, accent = "COMPLETE", (139, 136, 145)
-        elif not marked:
-            status, accent = ("CURRENT" if start <= today else "UP NEXT"), (77, 190, 116)
-            marked = True
-        else:
-            status, accent = "UPCOMING", coral
-        box = (margin, y, width - margin, y + row_height)
-        draw.rectangle(box, fill=(31, 30, 35), outline=(58, 56, 64), width=1)
-        map_name = week.get("map", "Unknown")
-        map_path = map_art.get(map_name.casefold())
-        if map_path and Path(map_path).exists():
-            try:
-                with Image.open(map_path) as source:
-                    background = ImageOps.fit(source.convert("RGB"), (width - margin * 2 - 2, row_height - 2), method=Image.Resampling.LANCZOS)
-                overlay = Image.new("RGBA", background.size, (14, 13, 17, 142))
-                background = Image.alpha_composite(background.convert("RGBA"), overlay).convert("RGB")
-                image.paste(background, (margin + 1, y + 1))
-            except OSError:
-                pass
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((margin, y, margin + 7, y + row_height), fill=accent)
-        label = week.get("label", f"Week {index + 1}").upper()
-        draw.text((margin + 28, y + 33), label, font=match_font(15, True), fill=(196, 193, 201), anchor="lm")
-        name_size = 46 if len(map_name) <= 13 else 38
-        draw.text((margin + 28, y + 82), map_name.upper(), font=match_font(name_size, True), fill=(250, 249, 251), anchor="lm")
-        date_text = fmt_range(start, end) if start and end else "Dates to be announced"
-        draw.text((width - margin - 24, y + 48), date_text.upper(), font=match_font(19, True), fill=(246, 244, 247), anchor="rm")
-        draw.text((width - margin - 24, y + 83), status, font=match_font(15, True), fill=accent, anchor="rm")
-
-    footer_y = header_height + len(weeks) * (row_height + row_gap) + 9
-    draw = ImageDraw.Draw(image)
-    if note_lines:
-        draw.text((margin, footer_y + 13), "QUEUE WINDOWS", font=match_font(15, True), fill=coral, anchor="lm")
-        for line in note_lines:
-            footer_y += 31
-            draw.text((margin, footer_y + 12), line, font=note_font, fill=(229, 227, 232), anchor="lm")
-    return image
-
-
 async def schedule_card_file(season, today):
     map_art = {}
     try:
@@ -576,10 +387,7 @@ async def schedule_card_file(season, today):
     except Exception as exc:
         print(f"Schedule map art unavailable: {exc}")
     loop = asyncio.get_running_loop()
-    image = await loop.run_in_executor(None, draw_schedule_card, season, map_art, today)
-    buffer = io.BytesIO()
-    image.save(buffer, "PNG")
-    buffer.seek(0)
+    buffer = await loop.run_in_executor(None, render_schedule_card, season, map_art, today)
     return discord.File(buffer, filename="premier-schedule.png")
 
 
@@ -1434,354 +1242,6 @@ async def matchfeed_loop():
         await asyncio.sleep(max(1, 300 - (loop.time() - cycle_started)))
 
 
-def draw_play_result(detail, queued_players, all_teammates, representative, map_path):
-    meta = detail.get("metadata", {})
-    teams = {t.get("team_id"): t for t in detail.get("teams", [])}
-    team = teams.get(representative.get("team_id"), {})
-    won = bool(team.get("won"))
-    our_score = (team.get("rounds") or {}).get("won", 0)
-    their_score = (team.get("rounds") or {}).get("lost", 0)
-    map_data = meta.get("map") or {}
-    map_name = map_data.get("name", "Unknown")
-    started = parse_time(meta.get("started_at"))
-    duration_ms = meta.get("game_length_in_ms") or 0
-    duration = f"{duration_ms // 60000} min" if duration_ms else "Competitive"
-    stats_by_id, kills_per_round, first_bloods, first_deaths = {}, {}, {}, {}
-    for kill in detail.get("kills") or []:
-        killer = (kill.get("killer") or {}).get("puuid")
-        round_number = kill.get("round", 0) or 0
-        if killer:
-            kills_per_round.setdefault(round_number, {}).setdefault(killer, 0)
-            kills_per_round[round_number][killer] += 1
-    kill_events_by_round = {}
-    for event in detail.get("kills") or []:
-        kill_events_by_round.setdefault(event.get("round", 0) or 0, []).append(event)
-    for events in kill_events_by_round.values():
-        if not events:
-            continue
-        first_event = min(events, key=lambda event: event.get("time_in_round_in_ms", 0))
-        first_killer = (first_event.get("killer") or {}).get("puuid")
-        first_victim = (first_event.get("victim") or {}).get("puuid")
-        if first_killer:
-            first_bloods[first_killer] = first_bloods.get(first_killer, 0) + 1
-        if first_victim:
-            first_deaths[first_victim] = first_deaths.get(first_victim, 0) + 1
-    for p in all_teammates:
-        st = p.get("stats", {})
-        stats_by_id[p.get("puuid")] = st
-    team_mvp_id = max(stats_by_id, key=lambda puuid: stats_by_id[puuid].get("score", 0)) if stats_by_id else None
-    team_lvp_id = min(stats_by_id, key=lambda puuid: stats_by_id[puuid].get("score", 0)) if stats_by_id else None
-    round_count = max(our_score + their_score, 1)
-    deaths_by_round = _deaths_by_round(detail)
-    clutch_wins = _clutch_wins(detail, all_teammates)
-    assists_by_id = {p.get("puuid"): (p.get("stats") or {}).get("assists", 0) for p in all_teammates}
-    damage_by_id = {
-        p.get("puuid"): round(((p.get("stats") or {}).get("damage") or {}).get("dealt", 0) / round_count)
-        for p in all_teammates
-    }
-    most_assists = max(assists_by_id.values(), default=0)
-    highest_adr = max(damage_by_id.values(), default=0)
-    lowest_deaths = min(((p.get("stats") or {}).get("deaths", 0) for p in all_teammates), default=0)
-    tracked = []
-    for p in queued_players:
-        st = p.get("stats", {})
-        shots = st.get("headshots", 0) + st.get("bodyshots", 0) + st.get("legshots", 0)
-        hs = round(st.get("headshots", 0) * 100 / shots) if shots else 0
-        tags = []
-        puuid = p.get("puuid")
-        best_round = max((kills_per_round.get(r, {}).get(puuid, 0) for r in kills_per_round), default=0)
-        if best_round >= 5: tags.append("ACE")
-        elif best_round == 4: tags.append("QUAD")
-        if puuid == team_mvp_id: tags.append("MVP")
-        if first_bloods.get(puuid, 0) >= 3: tags.append("ENTRY")
-        if st.get("kills", 0) >= 15 and hs >= 30: tags.append("DINK MACHINE")
-        if most_assists >= 8 and assists_by_id.get(puuid, 0) == most_assists: tags.append("ASSIST KING")
-        if highest_adr >= 160 and damage_by_id.get(puuid, 0) == highest_adr: tags.append("DAMAGE DEALER")
-        if round_count >= 10 and ((st.get("deaths", 0) / round_count) <= 0.45) and st.get("deaths", 0) == lowest_deaths:
-            tags.append("SURVIVOR")
-        clutch_count = clutch_wins.get(puuid, 0)
-        max_clutches = max(clutch_wins.values(), default=0)
-        if max_clutches > 0 and clutch_count == max_clutches:
-            tags.append(f"CLUTCH x{clutch_count}")
-        death_rounds = sum(1 for events in deaths_by_round.values() if events.get(puuid, 0) > 0)
-        if round_count > 0 and death_rounds >= round_count: tags.append("VICTIM")
-        if puuid == team_lvp_id: tags.append("LVP")
-        tracked.append({"p": p, "st": st, "hs": hs, "tags": tags,
-                        "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0),
-                        "adr": damage_by_id.get(puuid, 0)})
-
-    width, hero_h, gap = 1200, 270, 18
-    recap = _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration)
-    headline = _play_headline(all_teammates, our_score, their_score)
-    recap_font = match_font(23)
-    measure_draw = ImageDraw.Draw(Image.new("RGB", (width, 1)))
-    columns, side_pad, column_gap = 2, 24, 18
-    recap_lines = _wrap_image_text(measure_draw, recap, recap_font, width - 2 * side_pad, 7)
-    summary_h = 114 + max(0, len(recap_lines) - 1) * 42
-    card_width = (width - 2 * side_pad - column_gap) // columns
-    tag_font = match_font(14, True)
-    tag_width_limit = card_width - 132
-    max_tag_rows = 1
-    for item in tracked:
-        used, tag_rows = 0, 1
-        for tag in item["tags"]:
-            tag_width = int(measure_draw.textlength(tag, font=tag_font)) + 16
-            if used and used + tag_width > tag_width_limit:
-                tag_rows += 1
-                used = 0
-            used += tag_width + 6
-        max_tag_rows = max(max_tag_rows, tag_rows)
-    card_h = 208 + (max_tag_rows - 1) * 28
-    rows = max(1, (len(tracked) + columns - 1) // columns)
-    cards_top = hero_h + summary_h + 22
-    height = cards_top + rows * (card_h + gap) - gap + 26
-    image = Image.new("RGB", (width, height), (17, 17, 22))
-    draw = ImageDraw.Draw(image)
-    if map_path and Path(map_path).exists():
-        try:
-            bg = Image.open(map_path).convert("RGB")
-            ratio = max(width / bg.width, hero_h / bg.height)
-            bg = bg.resize((int(bg.width * ratio), int(bg.height * ratio)))
-            left, top = (bg.width - width) // 2, (bg.height - hero_h) // 2
-            bg = bg.crop((left, top, left + width, top + hero_h))
-            bg = Image.blend(bg, Image.new("RGB", bg.size, (8, 9, 12)), 0.60)
-            image.paste(bg, (0, 0))
-        except Exception:
-            pass
-    draw.rectangle((0, hero_h, width, height), fill=(17, 17, 22))
-    accent = (72, 181, 105) if won else (220, 86, 94)
-    f_sub = match_font(19)
-    draw.text((side_pad, 169), map_name.upper(), font=match_font(56, True), fill=(250, 250, 252), anchor="lm")
-    if started:
-        match_time = started.astimezone(timezone.utc)
-        date_label = f"{match_time.strftime('%b %d, %Y, ')}{match_time.strftime('%I').lstrip('0')}:{match_time.strftime('%M:%S %p')}"
-    else:
-        date_label = "Time unavailable"
-    draw.text((side_pad, 224), f"Competitive · {duration} · {date_label}", font=f_sub, fill=(207, 205, 210), anchor="lm")
-    badge = f"{our_score}-{their_score}"
-    badge_box = (width - side_pad - 208, 186, width - side_pad, 238)
-    draw_soft_box(image, badge_box, accent, opacity=238, radius=7)
-    draw.text(((badge_box[0] + badge_box[2]) // 2, (badge_box[1] + badge_box[3]) // 2), badge,
-              font=match_font(21, True), fill=(255, 250, 250), anchor="mm")
-    coral = (240, 99, 106)
-    headline_size = 32
-    headline_font = match_font(headline_size, True)
-    while headline_size > 22 and draw.textlength(headline, font=headline_font) > width - 64:
-        headline_size -= 1
-        headline_font = match_font(headline_size, True)
-    draw.text((side_pad, hero_h + 44), headline, font=headline_font, fill=coral, anchor="lm")
-    for line_index, line in enumerate(recap_lines):
-        draw.text((side_pad, hero_h + 100 + line_index * 42), line, font=recap_font, fill=(226, 226, 232), anchor="lm")
-    for index, item in enumerate(tracked):
-        col, row = index % columns, index // columns
-        if len(tracked) % columns and row == rows - 1:
-            x = (width - card_width) // 2
-        else:
-            x = side_pad + col * (card_width + column_gap)
-        y = cards_top + row * (card_h + gap)
-        right = x + card_width
-        draw.rounded_rectangle((x, y, right, y + card_h), radius=14, fill=(28, 27, 31), outline=(42, 40, 45), width=1)
-        p, st = item["p"], item["st"]
-        icon = p.get("_play_icon")
-        icon_size = 76
-        icon_x, icon_y = x + 18, y + 18
-        draw.rounded_rectangle((icon_x, icon_y, icon_x + icon_size, icon_y + icon_size), radius=8, fill=(28, 27, 31))
-        if icon:
-            icon = ImageOps.contain(icon.convert("RGBA"), (icon_size, icon_size), method=Image.Resampling.LANCZOS)
-            fitted_x = icon_x + (icon_size - icon.width) // 2
-            fitted_y = icon_y + (icon_size - icon.height) // 2
-            image.paste(icon, (fitted_x, fitted_y), icon)
-        player_name = str(p.get("name", "?"))
-        player_name_size = 25
-        player_name_font = match_font(player_name_size, True)
-        player_name_x = x + 112
-        while player_name_size > 18 and draw.textlength(player_name, font=player_name_font) > right - player_name_x - 20:
-            player_name_size -= 1
-            player_name_font = match_font(player_name_size, True)
-        player_blue = (164, 194, 245)
-        draw.text((player_name_x, y + 18), player_name, font=player_name_font, fill=player_blue, anchor="lt")
-        tx, tag_row = player_name_x, 0
-        for tag in item["tags"]:
-            tw = int(draw.textlength(tag, font=tag_font)) + 16
-            max_right = right - 20
-            if tx + tw > max_right:
-                tag_row += 1
-                tx = player_name_x
-            tag_key = tag.split(" x", 1)[0]
-            tag_colour, tag_text = PLAY_TAG_STYLES.get(tag_key, ((68, 68, 78), (235, 235, 240)))
-            tag_y = y + 54 + tag_row * 32
-            draw_soft_box(image, (tx, tag_y, tx + tw, tag_y + 30), tag_colour, opacity=222, radius=3)
-            text_bbox = tag_font.getbbox(tag, anchor="mm")
-            text_center_offset = (text_bbox[1] + text_bbox[3]) / 2
-            draw.text((tx + tw / 2, tag_y + 15 - text_center_offset),
-                      tag, font=tag_font, fill=tag_text, anchor="mm")
-            tx += tw + 6
-        stat_label_y = y + 118 + tag_row * 32
-        stat_value_y = stat_label_y + 31
-        labels = [("KDA", f"{st.get('kills',0)}/{st.get('deaths',0)}/{st.get('assists',0)}"),
-                  ("ACS", str(round(st.get("score", 0) / round_count))),
-                  ("KD", f"{st.get('kills',0) / max(st.get('deaths',0),1):.2f}")]
-        cell_w = (right - x - 44) // 3
-        for cell, (label, value) in enumerate(labels):
-            cx = x + 22 + cell * cell_w + cell_w // 2
-            draw.text((cx, stat_label_y), label, font=match_font(16), fill=(154, 151, 160), anchor="mm")
-            draw.text((cx, stat_value_y), value, font=match_font(24, True), fill=(247, 246, 248), anchor="mm")
-        subtext_y = stat_value_y + 33
-        draw.text(((x + right) // 2, subtext_y),
-                  f"HS {item['hs']}% | FB {item['fb']} | FD {item['fd']}",
-                  font=match_font(15), fill=(155, 152, 161), anchor="mm")
-    buffer = io.BytesIO()
-    image.save(buffer, "PNG")
-    buffer.seek(0)
-    return buffer
-
-
-def _wrap_image_text(draw, text, image_font, max_width, max_lines=2):
-    words, lines, current, truncated = text.split(), [], "", False
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if current and draw.textlength(candidate, font=image_font) > max_width:
-            lines.append(current)
-            current = word
-            if len(lines) == max_lines:
-                truncated = True
-                break
-        else:
-            current = candidate
-    if current and len(lines) < max_lines:
-        lines.append(current)
-    if truncated and lines:
-        lines[-1] = lines[-1].rstrip(" .") + "..."
-    return lines
-
-
-def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration):
-    result = "snatched the win" if won else "took the L"
-    recap = f"Your queue {result} on {map_name} after {duration} of competitive Valorant, {our_score}-{their_score}."
-    if not all_teammates:
-        return recap
-    ranked = sorted(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0), reverse=True)
-    strongest, weakest = ranked[0], ranked[-1]
-    top_stats, low_stats = strongest.get("stats") or {}, weakest.get("stats") or {}
-    strongest_name = strongest.get("name", "A teammate")
-    top_acs = round(top_stats.get("score", 0) / max(our_score + their_score, 1))
-    top_kd = top_stats.get("kills", 0) / max(top_stats.get("deaths", 0), 1)
-    top_title = "the team's certified tryhard" if top_acs >= 220 or top_kd >= 1.2 else "the designated carry"
-    recap += (f" {strongest_name} clocked in as {top_title}, topping the team with {top_acs} ACS, "
-              f"{top_stats.get('kills', 0)}/{top_stats.get('deaths', 0)}/{top_stats.get('assists', 0)} "
-              f"and a {top_kd:.2f} KD. Someone's definitely watching the VOD back tonight.")
-    if strongest.get("puuid") != weakest.get("puuid"):
-        low_name = weakest.get("name", "a teammate")
-        low_acs = round(low_stats.get("score", 0) / max(our_score + their_score, 1))
-        low_kd = low_stats.get("kills", 0) / max(low_stats.get("deaths", 0), 1)
-        if low_stats.get("deaths", 0) >= 18:
-            roast = random.choice(("the respawn screen got more quality time than the team", "collected deaths like loyalty stamps", "the enemy team learned their route to spawn by heart"))
-        elif low_acs < 100:
-            roast = random.choice(("their crosshair was apparently sightseeing", "their aim took an unscheduled lunch break", "the bullets were social distancing"))
-        elif low_kd < 0.6:
-            roast = random.choice(("the kill feed was not their biggest fan", "their KD ratio needs a pep talk", "the duels were a generous donation program"))
-        else:
-            roast = random.choice(("it was a character-building shift", "the scoreboard has chosen violence", "one to quietly blame on the warm-up"))
-        recap += (f" {low_name} had the roughest shift: {low_acs} ACS and "
-                  f"{low_stats.get('kills', 0)}/{low_stats.get('deaths', 0)}/{low_stats.get('assists', 0)} "
-                  f"({low_kd:.2f} KD); {roast}.")
-    high_deaths = max(all_teammates, key=lambda p: (p.get("stats") or {}).get("deaths", 0))
-    high_death_stats = high_deaths.get("stats") or {}
-    if high_deaths.get("puuid") != weakest.get("puuid") and high_death_stats.get("deaths", 0) >= 18:
-        recap += (f" {high_deaths.get('name', 'A teammate')} also took {high_death_stats.get('deaths', 0)} trips "
-                  f"back to spawn ({high_death_stats.get('kills', 0)}/{high_death_stats.get('deaths', 0)}/{high_death_stats.get('assists', 0)}); "
-                  "the walk back is basically muscle memory now.")
-    events = []
-    for item in tracked:
-        name = item["p"].get("name", "A queued player")
-        for tag in item["tags"]:
-            if tag in ("QUAD", "ACE"):
-                events.append(f"{name} landed a {tag.lower()} and immediately became impossible to queue with")
-            elif tag == "VICTIM":
-                events.append(f"{name} died in every round, a truly committed performance")
-            elif tag == "ENTRY":
-                events.append(f"{name} kicked open {item['fb']} rounds with first bloods")
-            elif tag == "DINK MACHINE":
-                events.append(f"{name} hit {item['hs']}% headshots and is now legally allowed to say 'nice crosshair'")
-            elif tag == "ASSIST KING":
-                events.append(f"{name} handed out {item['st'].get('assists', 0)} assists like party invites")
-            elif tag == "DAMAGE DEALER":
-                events.append(f"{name} put up {item['adr']} ADR and kept the damage numbers employed")
-            elif tag == "SURVIVOR":
-                events.append(f"{name} only went down {item['st'].get('deaths', 0)} times and stayed out of the respawn queue")
-            elif tag.startswith("CLUTCH"):
-                events.append(f"{name} won {tag.rsplit('x', 1)[-1]} clutch round(s) and will mention it all week")
-    if events:
-        recap += " " + "; ".join(events[:2]) + "."
-    margin = abs(our_score - their_score)
-    recap += f" The final margin was {margin} round{'s' if margin != 1 else ''}; the group chat has enough material for the post-game review."
-    return recap
-
-
-def _play_headline(all_teammates, our_score, their_score):
-    if not all_teammates:
-        return "MATCH RECAP"
-    weakest = min(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0))
-    strongest = max(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0))
-    stats = weakest.get("stats") or {}
-    acs = round(stats.get("score", 0) / max(our_score + their_score, 1))
-    name = weakest.get("name", "PLAYER").upper()
-    if weakest.get("puuid") == strongest.get("puuid"):
-        return f"{name} WAS BOTH THE CARRY AND THE CONTENT"
-    if stats.get("deaths", 0) >= 18:
-        return f"{name}'S RESPAWN BUTTON MVP RUN"
-    if acs < 100:
-        return f"{name}'S CROSSHAIR TOOK THE NIGHT OFF"
-    return f"{name}'S LOWEST IMPACT: {acs} ACS"
-
-
-def _deaths_by_round(detail):
-    deaths = {}
-    for event in detail.get("kills") or []:
-        victim = (event.get("victim") or {}).get("puuid")
-        if victim:
-            round_number = event.get("round", 0) or 0
-            deaths.setdefault(round_number, {})[victim] = deaths.setdefault(round_number, {}).get(victim, 0) + 1
-    return deaths
-
-
-def _clutch_wins(detail, players):
-    """Count won rounds where a player was left alone against at least two opponents."""
-    roster = detail.get("players") or players
-    team_by_puuid = {p.get("puuid"): p.get("team_id") for p in roster if p.get("puuid") and p.get("team_id")}
-    members_by_team = {}
-    for puuid, team_id in team_by_puuid.items():
-        members_by_team.setdefault(team_id, set()).add(puuid)
-    if len(members_by_team) < 2:
-        return {}
-    kills_by_round = {}
-    for event in detail.get("kills") or []:
-        kills_by_round.setdefault(event.get("round", 0) or 0, []).append(event)
-    clutch_counts = {}
-    for index, round_data in enumerate(detail.get("rounds") or []):
-        round_number = round_data.get("id", index)
-        winner_text = str(round_data.get("winning_team") or "").casefold()
-        winner = next((team for team in members_by_team if str(team).casefold() == winner_text), None)
-        if winner is None:
-            continue
-        alive = {team: set(puuids) for team, puuids in members_by_team.items()}
-        possible_clutchers = set()
-        events = sorted(kills_by_round.get(round_number, []), key=lambda event: event.get("time_in_round_in_ms", 0))
-        for event in events:
-            victim = (event.get("victim") or {}).get("puuid")
-            victim_team = team_by_puuid.get(victim)
-            if victim and victim_team in alive:
-                alive[victim_team].discard(victim)
-            for team, team_players in alive.items():
-                opponents_alive = sum(len(other) for other_id, other in alive.items() if other_id != team)
-                if len(team_players) == 1 and opponents_alive >= 2:
-                    possible_clutchers.update(team_players)
-        for puuid in possible_clutchers:
-            if team_by_puuid.get(puuid) == winner and puuid in alive.get(winner, set()):
-                clutch_counts[puuid] = clutch_counts.get(puuid, 0) + 1
-    return clutch_counts
-
-
 async def play_match_image(detail, queued_players, all_teammates, representative):
     map_data = (detail.get("metadata", {}).get("map") or {})
     map_uuid = map_data.get("id") or map_data.get("uuid")
@@ -1852,36 +1312,10 @@ async def rank_change_image(player_name, from_id, from_name, to_id, to_name, dir
         icon_img(tier_icons.get(str(from_id)), 132),
         icon_img(tier_icons.get(str(to_id)), 132),
     )
-
-    image = Image.new("RGB", (1200, 500), (17, 16, 20))
-    draw = ImageDraw.Draw(image)
-    accent = (77, 190, 116) if direction == "up" else (224, 86, 99)
-    draw.rounded_rectangle((22, 22, 1178, 478), radius=18, fill=(28, 27, 32), outline=(57, 55, 63), width=2)
-    draw.text((58, 70), "RANK UP" if direction == "up" else "DERANK", font=match_font(38, True), fill=accent, anchor="lm")
-    draw.text((1140, 70), player_name, font=match_font(27, True), fill=(245, 244, 247), anchor="rm")
-    draw.line((58, 108, 1142, 108), fill=(58, 56, 64), width=2)
-
-    panels = ((60, 148, 530, 425), (670, 148, 1140, 425))
-    for panel in panels:
-        draw.rounded_rectangle(panel, radius=12, fill=(34, 33, 39), outline=(61, 59, 67), width=1)
-    draw.text((295, 178), "FROM", font=match_font(16, True), fill=(154, 151, 161), anchor="mm")
-    draw.text((905, 178), "TO", font=match_font(16, True), fill=(154, 151, 161), anchor="mm")
-
-    def paste_tier_icon(icon, center_x):
-        if icon is None:
-            return
-        icon = ImageOps.contain(icon.convert("RGBA"), (132, 132), method=Image.Resampling.LANCZOS)
-        image.paste(icon, (center_x - icon.width // 2, 202 + (132 - icon.height) // 2), icon)
-
-    paste_tier_icon(old_icon, 295)
-    paste_tier_icon(new_icon, 905)
-    draw.text((295, 365), from_name.upper(), font=match_font(27, True), fill=(218, 216, 222), anchor="mm")
-    draw.text((905, 365), to_name.upper(), font=match_font(27, True), fill=(250, 249, 251), anchor="mm")
-    draw.text((600, 282), "→", font=match_font(48, True), fill=accent, anchor="mm")
-    draw.text((600, 441), "SUBRANKS AND FULL TIER PROMOTIONS COUNT", font=match_font(14, True), fill=(151, 148, 158), anchor="mm")
-    buffer = io.BytesIO()
-    image.save(buffer, "PNG")
-    buffer.seek(0)
+    loop = asyncio.get_running_loop()
+    buffer = await loop.run_in_executor(
+        None, draw_rank_change_card, player_name, from_name, to_name, direction, old_icon, new_icon
+    )
     return discord.File(buffer, filename="rank-change.png")
 
 
@@ -2512,38 +1946,6 @@ async def agent_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
-def draw_lineup_card(map_name, week_label, slots, agent_icons):
-    width, header, row_height = 900, 156, 112
-    rows = max(5, len(slots))
-    height = header + rows * row_height + 24
-    image = Image.new("RGB", (width, height), (15, 25, 35))
-    draw = ImageDraw.Draw(image)
-    draw.rectangle([0, 0, width, 7], fill=(255, 70, 85))
-    draw.text((32, 48), map_name, font=font(34, True), fill=WHITE, anchor="lm")
-    draw.text((34, 94), week_label or "Premier lineup", font=font(17), fill=GREY, anchor="lm")
-    picked = sum(1 for slot in slots if slot.get("agent"))
-    draw.text((width - 32, 70), f"{picked}/5 PICKS", font=font(20, True), fill=WHITE, anchor="rm")
-
-    for index in range(rows):
-        y = header + index * row_height
-        slot = slots[index] if index < len(slots) else {}
-        if index % 2 == 0:
-            draw.rounded_rectangle([20, y + 5, width - 20, y + row_height - 5], radius=12, fill=(20, 32, 45))
-        agent = slot.get("agent")
-        icon = agent_icons.get(agent.casefold()) if agent else None
-        if icon:
-            image.paste(icon, (42, y + 20), icon)
-        else:
-            draw.rounded_rectangle([42, y + 20, 114, y + 92], radius=12, fill=(39, 53, 69))
-            label = agent[:2].upper() if agent else "—"
-            draw.text((78, y + 56), label, font=font(18, True), fill=WHITE, anchor="mm")
-        player_name = slot.get("player") or "Open slot"
-        draw.text((142, y + 43), player_name[:34], font=font(21, True), fill=WHITE, anchor="lm")
-        subtext = slot.get("riot") or (agent if agent else "Waiting for an agent pick")
-        draw.text((142, y + 77), subtext[:44], font=font(15), fill=GREY, anchor="lm")
-    return image
-
-
 async def lineup_card_file(map_name, week_label, slots):
     agent_icons = {}
     try:
@@ -2564,10 +1966,7 @@ async def lineup_card_file(map_name, week_label, slots):
         print(f"Lineup agent icons unavailable: {exc}")
 
     loop = asyncio.get_running_loop()
-    card = await loop.run_in_executor(None, draw_lineup_card, map_name, week_label, slots, agent_icons)
-    buffer = io.BytesIO()
-    card.save(buffer, "PNG")
-    buffer.seek(0)
+    buffer = await loop.run_in_executor(None, render_lineup_card, map_name, week_label, slots, agent_icons)
     return discord.File(buffer, filename="lineup.png")
 
 
