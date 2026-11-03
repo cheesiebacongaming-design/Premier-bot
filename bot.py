@@ -20,6 +20,7 @@ from commands import install_command_cogs
 from graphics.assets import load_icon_image
 from graphics.lineup import render_lineup_card
 from graphics.match_card import draw_play_result
+from graphics.player_history import render_player_history
 from graphics.rank_change import draw_rank_change_card
 from graphics.schedule import render_schedule_card
 from graphics.scoreboard import draw_scoreboard
@@ -785,6 +786,7 @@ def parse_stored(m):
         "started": meta.get("started_at"),
         "map": (meta.get("map") or {}).get("name", "?"),
         "agent": (s.get("character") or {}).get("name", "?"),
+        "agent_id": str((s.get("character") or {}).get("id") or (s.get("character") or {}).get("uuid") or "").lower(),
         "k": s.get("kills", 0),
         "d": s.get("deaths", 0),
         "a": s.get("assists", 0),
@@ -1603,20 +1605,26 @@ async def player_cmd(interaction: discord.Interaction, name: str = "", tag: str 
     if not rows:
         return await interaction.followup.send(f"No {mode_value} matches found for {name}#{tag}.")
 
-    wins = sum(r["won"] is True for r in rows)
-    losses = sum(r["won"] is False for r in rows)
-    kills, deaths = sum(r["k"] for r in rows), sum(r["d"] for r in rows)
-    avg = lambda key: round(sum(r[key] for r in rows) / len(rows))
-    lines = [
-        f"{WIN if r['won'] else LOSS if r['won'] is False else DRAW} **{r['map']}** {r['score']} \u00b7 {r['agent']} \u00b7 "
-        f"{r['k']}/{r['d']}/{r['a']} \u00b7 ACS {r['acs']} \u00b7 {ts(r['started'], 'd')}"
-        for r in rows
-    ]
-    embed = discord.Embed(title=f"{name}#{tag} \u00b7 {mode_value}", description="\n".join(lines), colour=0xFF4655)
-    embed.set_footer(
-        text=f"{wins}W-{losses}L \u00b7 K/D {kills / max(deaths, 1):.2f} \u00b7 ACS {avg('acs')} \u00b7 ADR {avg('adr')} \u00b7 HS {avg('hs')}%"
-    )
-    await interaction.followup.send(embed=embed)
+    try:
+        catalog = await icon_maps()
+    except Exception as exc:
+        print(f"Player history agent catalog unavailable: {exc}")
+        catalog = {}
+    by_name = {agent_name.casefold(): agent_id for agent_id, agent_name in catalog.get("agent_names", {}).items()}
+    icon_urls = {}
+    for row in rows:
+        key = (row.get("agent_id") or row.get("agent") or "").casefold()
+        agent_id = row.get("agent_id") or by_name.get((row.get("agent") or "").casefold())
+        url = catalog.get("agents", {}).get(agent_id)
+        if not url and agent_id:
+            url = f"https://media.valorant-api.com/agents/{agent_id}/displayicon.png"
+        if key and url:
+            icon_urls[key] = url
+    loaded = await asyncio.gather(*(icon_img(url, 68) for url in icon_urls.values()))
+    icons = dict(zip(icon_urls, loaded))
+    loop = asyncio.get_running_loop()
+    image = await loop.run_in_executor(None, render_player_history, name, tag, mode_value, rows, icons)
+    await interaction.followup.send(file=discord.File(image, filename="player-history.png"))
 
 
 @tree.command(name="findteam", description="Find your team ID from a player's Riot ID")

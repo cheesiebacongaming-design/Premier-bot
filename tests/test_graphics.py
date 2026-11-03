@@ -4,6 +4,7 @@ from PIL import Image
 
 from graphics.lineup import render_lineup_card
 from graphics.match_card import _assign_unique_tags, draw_play_result
+from graphics.player_history import render_player_history
 from graphics.rank_change import draw_rank_change_card
 from graphics.schedule import render_schedule_card
 
@@ -50,6 +51,20 @@ def test_lineup_renderer_returns_a_five_slot_card():
     width, height = _png_size(buffer)
     assert width == 900
     assert height == 156 + 5 * 112 + 24
+
+
+def test_player_history_renders_grouped_rows_with_missing_icons():
+    rows = [
+        {"started": "2026-11-03T12:00:00Z", "map": "Haven", "agent": "Sova", "won": True,
+         "score": "13-9", "k": 14, "d": 10, "a": 5, "acs": 200, "adr": 145, "hs": 25},
+        {"started": "2026-11-02T12:00:00Z", "map": "Abyss", "agent": "Clove", "won": None,
+         "score": "12-12", "k": 10, "d": 10, "a": 8, "acs": 170, "adr": 120, "hs": 20},
+    ]
+
+    width, height = _png_size(render_player_history("Player", "EU", "competitive", rows, {}))
+
+    assert width == 1200
+    assert height == 248 + 2 * (46 + 106) + 20
 
 
 def test_rank_change_renderer_returns_fixed_size_png_without_icons():
