@@ -1469,6 +1469,19 @@ NO_PLAYER = "Give a name and tag (or Name#TAG), mention a member who has registe
 @tree.command(name="register", description="Link your Valorant account to your Discord user")
 @app_commands.describe(riot_id="Your Riot ID, like Name#TAG", region="eu, na, ap, kr, latam or br (default: your team's)")
 async def register(interaction: discord.Interaction, riot_id: str, region: str = ""):
+    await register_account(interaction, interaction.user, riot_id, region)
+
+
+@tree.command(name="registeruser", description="Link a Valorant account to another server member (administrators only)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(member="Server member to register", riot_id="Riot ID, like Name#TAG", region="eu, na, ap, kr, latam or br (default: your team's)")
+async def register_user(interaction: discord.Interaction, member: discord.Member, riot_id: str, region: str = ""):
+    if not interaction.guild or not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can use this command.", ephemeral=True)
+    await register_account(interaction, member, riot_id, region)
+
+
+async def register_account(interaction, target, riot_id, region):
     await interaction.response.defer(ephemeral=True)
     parts = split_riot_id(riot_id)
     if not parts:
@@ -1483,13 +1496,16 @@ async def register(interaction: discord.Interaction, riot_id: str, region: str =
             return await interaction.followup.send(f"Couldn't find {name}#{tag} in {reg}. Check the spelling and region.")
         # anything else (rate limit, API hiccup): save it anyway
     accounts = load_accounts()
-    accounts[str(interaction.user.id)] = {"name": name, "tag": tag, "region": reg}
+    accounts[str(target.id)] = {"name": name, "tag": tag, "region": reg}
     save_accounts(accounts)
     tier = ((data or {}).get("current") or {}).get("tier") or {} if isinstance(data, dict) else {}
-    msg = f"Registered **{name}#{tag}** ({reg})."
+    is_self = target.id == interaction.user.id
+    msg = f"Registered **{name}#{tag}** ({reg})"
+    msg += "." if is_self else f" for {target.display_name}."
     if tier.get("name"):
         msg += f" Current rank: {tier['name']}."
-    msg += "\nNow /rank and /player work without typing your name."
+    msg += ("\nNow /rank and /player work without typing your name." if is_self
+            else "\nThey can now use /rank and /player without typing their name.")
     await interaction.followup.send(msg)
 
 
@@ -2097,7 +2113,7 @@ for _cmd in (agent_cmd, assignagent, lineup, clearagent):
 HELP_SECTIONS = [
     ("Premier", ["schedule", "results", "mapresults", "scout", "agent", "lineup", "clearagent", "playbook"]),
     ("Players", ["register", "unregister", "accounts", "rank", "player", "recent", "play"]),
-    ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "testplaycard", "testrankcard", "clearcache"]),
+    ("Server managers", ["registeruser", "assignagent", "createplaybook", "setschedule", "testreminder", "testplaycard", "testrankcard", "clearcache"]),
     ("Troubleshooting", ["findteam", "debug"]),
 ]
 

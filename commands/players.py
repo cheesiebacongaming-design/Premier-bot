@@ -2,7 +2,7 @@
 
 from .base import make_command_cog
 
-COMMAND_NAMES = ("register", "unregister", "accounts", "rank", "player")
+COMMAND_NAMES = ("register", "registeruser", "unregister", "accounts", "rank", "player")
 
 
 def build_players_cog(commands):
