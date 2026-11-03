@@ -17,7 +17,9 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from discord import app_commands
 from config import REGIONS, SETTINGS
 from services.cache import JsonCache
+from services.match_history import MatchHistoryService
 from services.valorant_api import HenrikDevClient
+from utils.statistics import summarise_match
 
 TOKEN = SETTINGS.discord_token
 HENRIK_KEY = SETTINGS.henrik_api_key
@@ -106,6 +108,11 @@ def cached_api(path, ttl, **params):
     return cache_store.get(path + json.dumps(params, sort_keys=True), ttl, lambda: api(path, **params))
 
 
+match_history = MatchHistoryService(
+    cached_api, api, AFFINITY, ROSTER, TEAM_ID, TEAM_NAME, TEAM_TAG
+)
+
+
 async def x_get(path, **params):
     async with client.x_session.get(
         "https://api.twitter.com/2" + path,
@@ -152,194 +159,34 @@ def ts(d, style="F"):
 
 
 def team_path():
-    if TEAM_ID:
-        return f"/valorant/v1/premier/{TEAM_ID}"
-    return f"/valorant/v1/premier/{quote(TEAM_NAME)}/{quote(TEAM_TAG)}"
+    return match_history.team_path()
 
 
 async def team_data():
-    """Live roster lookup (v2). Falls back to the v1 index lookup."""
-    v2 = (
-        f"/valorant/v2/premier/teams/{AFFINITY}/{TEAM_ID}"
-        if TEAM_ID
-        else f"/valorant/v2/premier/teams/{AFFINITY}/{quote(TEAM_NAME)}/{quote(TEAM_TAG)}"
-    )
-    try:
-        return await cached_api(v2, 3600)
-    except Exception:
-        return await cached_api(team_path(), 3600)
+    return await match_history.team_data()
 
 
 async def team_members():
-    try:
-        team = await team_data()
-    except Exception:
-        if ROSTER:
-            return {r.lower() for r in ROSTER}
-        raise
-    keys = set()
-    for m in team.get("member") or team.get("members") or []:
-        if m.get("puuid"):
-            keys.add(m["puuid"].lower())
-        if m.get("name"):
-            keys.add(f"{m['name']}#{m.get('tag', '')}".lower())
-    return keys
+    return await match_history.team_members()
 
 
 async def history_from_players():
-    """Build the match list from the roster's own Premier match histories."""
-    if ROSTER:
-        found, err = {}, None
-        async def fetch_player(entry):
-            name, _, tag = entry.rpartition("#")
-            return await cached_api(
-                f"/valorant/v1/stored-matches/{AFFINITY}/{quote(name.strip())}/{quote(tag.strip())}",
-                600, mode="premier", size=20,
-            )
-
-        results = await asyncio.gather(*(fetch_player(entry) for entry in ROSTER), return_exceptions=True)
-        for items in results:
-            if isinstance(items, Exception):
-                err = items
-                continue
-            for item in items or []:
-                meta = item.get("meta", {})
-                if meta.get("id"):
-                    found[meta["id"]] = {"id": meta["id"], "started_at": meta.get("started_at")}
-        if not found and err:
-            raise err
-        return sorted(found.values(), key=lambda m: m["started_at"] or "", reverse=True)
-    team = await team_data()
-    puuids = [m["puuid"] for m in (team.get("member") or team.get("members") or []) if m.get("puuid")][:5]
-    async def fetch_player_matches(puuid):
-        return await cached_api(
-            f"/valorant/v4/by-puuid/matches/{AFFINITY}/pc/{puuid}", 600, mode="premier", size=10
-        )
-
-    results = await asyncio.gather(*(fetch_player_matches(p) for p in puuids), return_exceptions=True)
-    seen, last_error = {}, None
-    for items in results:
-        if isinstance(items, Exception):
-            last_error = items
-            continue
-        for item in items or []:
-            meta = item.get("metadata", {})
-            mid = meta.get("match_id")
-            if not mid:
-                continue
-            rosters = [(t.get("premier_roster") or {}).get("id") for t in item.get("teams", [])]
-            rosters = [r for r in rosters if r]
-            if TEAM_ID and rosters and TEAM_ID not in rosters:
-                continue  # a different Premier team's match
-            seen[mid] = {"id": mid, "started_at": meta.get("started_at")}
-    if not seen and last_error:
-        raise last_error
-    return sorted(seen.values(), key=lambda m: m["started_at"] or "", reverse=True)
+    return await match_history.history_from_players()
 
 
 async def history():
-    try:
-        data = await cached_api(team_path() + "/history", 600)
-        matches = data.get("league_matches", []) if isinstance(data, dict) else data
-        if matches:
-            return sorted(matches, key=lambda m: m.get("started_at") or "", reverse=True)
-    except Exception:
-        pass  # the team isn't in HenrikDev's index, so use the players' histories
-    return await history_from_players()
+    return await match_history.history()
 
 
 async def match_detail(match_id: str, region=None):
-    return await api(f"/valorant/v4/match/{region or AFFINITY}/{match_id}")
+    return await match_history.match_detail(match_id, region)
 
 
-# ---------- Match summarising ----------
-def build_row(p, total_rounds, fb=0):
-    st = p.get("stats", {})
-    shots = st.get("headshots", 0) + st.get("bodyshots", 0) + st.get("legshots", 0)
-    agent = p.get("agent") or {}
-    tier = p.get("tier") or {}
-    return {
-        "puuid": p.get("puuid", ""),
-        "name": p.get("name", "?"),
-        "tag": p.get("tag", ""),
-        "agent": agent.get("name", "?"),
-        "agent_id": (agent.get("id") or "").lower(),
-        "tier": tier.get("id", 0),
-        "tier_name": tier.get("name", ""),
-        "k": st.get("kills", 0),
-        "d": st.get("deaths", 0),
-        "a": st.get("assists", 0),
-        "acs": round(st.get("score", 0) / total_rounds),
-        "hs": round(100 * st.get("headshots", 0) / shots) if shots else 0,
-        "adr": round((st.get("damage") or {}).get("dealt", 0) / total_rounds),
-        "fb": fb,
-    }
-
-
-def summarise(detail: dict, members: set, premier_team_id=None, premier_team_name=None, premier_team_tag=None):
-    """Work out which side was ours, the score, and both teams' scoreboards."""
-    meta = detail.get("metadata", {})
-    players = detail.get("players", [])
-    ours = [
-        p
-        for p in players
-        if (p.get("puuid") or "").lower() in members
-        or f"{p.get('name', '')}#{p.get('tag', '')}".lower() in members
-    ]
-    side = None
-    if ours:
-        side = max({p.get("team_id") for p in ours}, key=lambda t: sum(1 for p in ours if p.get("team_id") == t))
-    teams = {t.get("team_id"): t for t in detail.get("teams", [])}
-    if side is None and premier_team_id:
-        side = next((
-            t.get("team_id") for t in detail.get("teams", [])
-            if str((t.get("premier_roster") or {}).get("id", "")) == str(premier_team_id)
-        ), None)
-        if side is not None:
-            ours = [p for p in players if p.get("team_id") == side]
-    if side is None and premier_team_name:
-        target_name = premier_team_name.casefold()
-        target_tag = (premier_team_tag or "").casefold()
-        side = next((
-            t.get("team_id") for t in detail.get("teams", [])
-            if (t.get("premier_roster") or {}).get("name", "").casefold() == target_name
-            and (not target_tag or not (t.get("premier_roster") or {}).get("tag")
-                 or (t.get("premier_roster") or {}).get("tag", "").casefold() == target_tag)
-        ), None)
-        if side is not None:
-            ours = [p for p in players if p.get("team_id") == side]
-    mine = teams.get(side, {})
-    other_id, theirs = next(((k, t) for k, t in teams.items() if k != side), (None, {}))
-    rounds_won = (mine.get("rounds") or {}).get("won", 0)
-    rounds_lost = (mine.get("rounds") or {}).get("lost", 0)
-    total_rounds = max(rounds_won + rounds_lost, 1)
-
-    # first bloods: the first kill of every round
-    by_round = {}
-    for k in detail.get("kills") or []:
-        by_round.setdefault(k.get("round", 0), []).append(k)
-    fbs = {}
-    for ks in by_round.values():
-        first = min(ks, key=lambda k: k.get("time_in_round_in_ms", 0))
-        killer = (first.get("killer") or {}).get("puuid")
-        fbs[killer] = fbs.get(killer, 0) + 1
-
-    def rows_for(team_id):
-        rows = [build_row(p, total_rounds, fbs.get(p.get("puuid"), 0)) for p in players if p.get("team_id") == team_id]
-        return sorted(rows, key=lambda r: r["acs"], reverse=True)
-
-    return {
-        "map": (meta.get("map") or {}).get("name", "Unknown"),
-        "started": meta.get("started_at"),
-        "won": bool(mine.get("won")),
-        "score": f"{rounds_won}-{rounds_lost}",
-        "rw": rounds_won,
-        "rl": rounds_lost,
-        "us": (mine.get("premier_roster") or {}).get("name") or TEAM_NAME or "Your team",
-        "them": (theirs.get("premier_roster") or {}).get("name") or "Opponent",
-        "rows": rows_for(side),
-        "enemy_rows": rows_for(other_id),
-    }
+def summarise(detail: dict, members: set, premier_team_id=None, premier_team_name=None,
+              premier_team_tag=None):
+    return summarise_match(
+        detail, members, premier_team_id, premier_team_name, premier_team_tag, TEAM_NAME
+    )
 
 
 def player_table(rows):
