@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 import hashlib
 import io
 import json
@@ -19,6 +20,7 @@ from discord.ext import commands
 from config import REGIONS, SETTINGS
 from commands import install_command_cogs
 from services.cache import JsonCache
+from services.json_store import JsonStoreError, read_json, write_json
 from services.match_history import MatchHistoryService
 from services.valorant_api import HenrikDevClient
 from utils.statistics import summarise_match
@@ -447,8 +449,9 @@ async def load_summaries(matches):
 # ---------- Commands ----------
 def load_season():
     try:
-        return json.loads(SEASON_FILE.read_text())
-    except (FileNotFoundError, ValueError):
+        return read_json(SEASON_FILE, None)
+    except JsonStoreError as exc:
+        print(f"Could not load season configuration: {exc}")
         return None
 
 
@@ -701,15 +704,11 @@ async def testreminder(interaction: discord.Interaction, channel: discord.TextCh
 
 
 def load_queue_schedules():
-    try:
-        data = json.loads(QUEUE_SCHEDULE_FILE.read_text())
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError):
-        return {}
+    return read_json(QUEUE_SCHEDULE_FILE, {})
 
 
 def save_queue_schedules(data):
-    QUEUE_SCHEDULE_FILE.write_text(json.dumps(data, indent=2))
+    write_json(QUEUE_SCHEDULE_FILE, data, indent=2)
 
 
 async def discord_display_name(guild, user_id):
@@ -781,7 +780,13 @@ async def queue_reminder_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         now = datetime.now(timezone.utc)
-        configs = load_queue_schedules()
+        try:
+            configs = load_queue_schedules()
+        except JsonStoreError as exc:
+            print(f"Queue reminder state is unavailable: {exc}")
+            await asyncio.sleep(60)
+            continue
+        original_configs = deepcopy(configs)
         dirty = False
         for guild_id, config in configs.items():
             try:
@@ -813,7 +818,20 @@ async def queue_reminder_loop():
             except (KeyError, ValueError, ZoneInfoNotFoundError, discord.DiscordException) as exc:
                 print(f"Queue reminder failed for guild {guild_id}: {exc}")
         if dirty:
-            save_queue_schedules(configs)
+            try:
+                latest = load_queue_schedules()
+                for guild_id, updated in configs.items():
+                    original = original_configs.get(guild_id)
+                    current = latest.get(guild_id)
+                    if not original or not current:
+                        continue
+                    original_schedule = {key: value for key, value in original.items() if key != "last_reminder_date"}
+                    current_schedule = {key: value for key, value in current.items() if key != "last_reminder_date"}
+                    if original_schedule == current_schedule:
+                        current["last_reminder_date"] = updated.get("last_reminder_date")
+                save_queue_schedules(latest)
+            except JsonStoreError as exc:
+                print(f"Could not save queue reminder state: {exc}")
         await asyncio.sleep(60)
 
 
@@ -969,47 +987,51 @@ def parse_stored(m):
 
 
 def load_accounts():
-    try:
-        return json.loads(ACCOUNTS_FILE.read_text())
-    except (FileNotFoundError, ValueError):
-        return {}
+    return read_json(ACCOUNTS_FILE, {})
 
 
 def save_accounts(accounts):
-    ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=1))
+    write_json(ACCOUNTS_FILE, accounts, indent=1)
 
 
 def load_play_sessions():
-    try:
-        return json.loads(PLAY_SESSIONS_FILE.read_text())
-    except (FileNotFoundError, ValueError):
-        return {}
+    return read_json(PLAY_SESSIONS_FILE, {})
 
 
 def save_play_sessions(sessions):
-    PLAY_SESSIONS_FILE.write_text(json.dumps(sessions, indent=1))
+    write_json(PLAY_SESSIONS_FILE, sessions, indent=1)
 
 
 def load_matchfeeds():
-    try:
-        return json.loads(MATCHFEEDS_FILE.read_text())
-    except (FileNotFoundError, ValueError):
-        return {}
+    return read_json(MATCHFEEDS_FILE, {})
 
 
 def save_matchfeeds(feeds):
-    MATCHFEEDS_FILE.write_text(json.dumps(feeds, indent=1))
+    write_json(MATCHFEEDS_FILE, feeds, indent=1)
+
+
+def save_matchfeed_progress(snapshot, guild_key):
+    """Merge a poller's `seen` update without replacing newer admin settings."""
+    updated = snapshot.get(guild_key)
+    latest = load_matchfeeds()
+    current = latest.get(guild_key)
+    if not updated or not current:
+        return False
+    if (current.get("channel_id"), current.get("started_at")) != (
+        updated.get("channel_id"), updated.get("started_at")
+    ):
+        return False
+    current["seen"] = list(updated.get("seen", []))
+    save_matchfeeds(latest)
+    return True
 
 
 def load_rank_states():
-    try:
-        return json.loads(RANKSTATES_FILE.read_text())
-    except (FileNotFoundError, ValueError):
-        return {}
+    return read_json(RANKSTATES_FILE, {})
 
 
 def save_rank_states(states):
-    RANKSTATES_FILE.write_text(json.dumps(states, indent=1))
+    write_json(RANKSTATES_FILE, states, indent=1)
 
 
 @tree.command(name="play", description="Start or stop tracking a Valorant queue session")
@@ -1078,9 +1100,18 @@ async def matchfeed_cmd(interaction: discord.Interaction, channel: discord.TextC
 async def play_session_loop():
     await client.wait_until_ready()
     while not client.is_closed():
-        sessions = load_play_sessions()
-        accounts = load_accounts()
-        matchfeeds = load_matchfeeds()
+        try:
+            sessions = load_play_sessions()
+            accounts = load_accounts()
+            matchfeeds = load_matchfeeds()
+        except JsonStoreError as exc:
+            print(f"Play session state is unavailable: {exc}")
+            await asyncio.sleep(300)
+            continue
+        session_identities = {
+            key: (session.get("owner_id"), session.get("started_at"), tuple(session.get("players", [])))
+            for key, session in sessions.items()
+        }
         dirty = False
         for key, session in list(sessions.items()):
             try:
@@ -1129,7 +1160,19 @@ async def play_session_loop():
             except Exception as exc:
                 print(f"Play session poll failed for channel {key}: {exc}")
         if dirty:
-            save_play_sessions(sessions)
+            try:
+                latest = load_play_sessions()
+                for key, updated in sessions.items():
+                    current = latest.get(key)
+                    if not current:
+                        continue
+                    identity = (current.get("owner_id"), current.get("started_at"), tuple(current.get("players", [])))
+                    if identity == session_identities.get(key):
+                        current["seen"] = list(updated.get("seen", []))
+                        current["started_at"] = updated.get("started_at")
+                save_play_sessions(latest)
+            except JsonStoreError as exc:
+                print(f"Could not save play session state: {exc}")
         await asyncio.sleep(300)
 
 
@@ -1139,9 +1182,14 @@ async def matchfeed_loop():
     loop = asyncio.get_running_loop()
     while not client.is_closed():
         cycle_started = loop.time()
-        feeds = load_matchfeeds()
-        accounts = load_accounts()
-        rank_states = load_rank_states()
+        try:
+            feeds = load_matchfeeds()
+            accounts = load_accounts()
+            rank_states = load_rank_states()
+        except JsonStoreError as exc:
+            print(f"Match feed state is unavailable: {exc}")
+            await asyncio.sleep(300)
+            continue
         rank_state_updates = {}
         rank_changes = []
         try:
@@ -1276,7 +1324,7 @@ async def matchfeed_loop():
                     for guild_key, feed in eligible_feeds:
                         if not shared_teams:
                             feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
-                            save_matchfeeds(feeds)
+                            save_matchfeed_progress(feeds, guild_key)
                             continue
                         guild = client.get_guild(int(guild_key))
                         if guild is None:
@@ -1302,7 +1350,7 @@ async def matchfeed_loop():
                                 guild_groups.append((team_id, group, list(dict.fromkeys(mentions)), member_account_keys))
                         if not guild_groups:
                             feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
-                            save_matchfeeds(feeds)
+                            save_matchfeed_progress(feeds, guild_key)
                             continue
                         guild_groups.sort(key=lambda item: (
                             len(item[1]["account_keys"]),
@@ -1339,7 +1387,7 @@ async def matchfeed_loop():
                                 print(f"Could not post match feed {match_id} in guild {guild_key}: {exc}")
                                 continue
                             feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
-                            save_matchfeeds(feeds)
+                            save_matchfeed_progress(feeds, guild_key)
 
                 for event in rank_changes:
                     try:
@@ -2361,14 +2409,11 @@ async def agent_names():
 
 
 def load_agents():
-    try:
-        return json.loads(AGENTS_FILE.read_text())
-    except (FileNotFoundError, ValueError):
-        return {}
+    return read_json(AGENTS_FILE, {})
 
 
 def save_agents(data):
-    AGENTS_FILE.write_text(json.dumps(data, indent=1))
+    write_json(AGENTS_FILE, data, indent=1)
 
 
 def matching_map_key(data, map_name):
@@ -2573,14 +2618,11 @@ async def lineup(interaction: discord.Interaction, map_name: str = ""):
 
 
 def load_playbooks():
-    try:
-        return json.loads(PLAYBOOK_FILE.read_text())
-    except (FileNotFoundError, ValueError):
-        return {}
+    return read_json(PLAYBOOK_FILE, {})
 
 
 def save_playbooks(data):
-    PLAYBOOK_FILE.write_text(json.dumps(data, indent=1))
+    write_json(PLAYBOOK_FILE, data, indent=1)
 
 
 @tree.command(name="playbook", description="Show the notes and links for a map")
