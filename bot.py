@@ -43,6 +43,7 @@ ACCOUNTS_FILE = Path("accounts.json")  # Discord user -> Riot ID
 AGENTS_FILE = Path("agents.json")  # map -> {Discord user -> agent}
 PLAY_SESSIONS_FILE = Path("play_sessions.json")
 MATCHFEEDS_FILE = Path("matchfeeds.json")  # guild -> auto match feed channel/state
+RANKSTATES_FILE = Path("rankstates.json")  # last observed rank per linked Riot ID
 ICON_DIR = Path("icons")
 ICON_DIR.mkdir(exist_ok=True)
 
@@ -650,30 +651,133 @@ def fmt_range(start, end):
     return f"{a:%b} {a.day}\u2013{b.day}" if a.month == b.month else f"{a:%b} {a.day} \u2013 {b:%b} {b.day}"
 
 
-@tree.command(name="schedule", description="Premier maps for this act, plus match times")
+async def valorant_map_catalog():
+    async def fetch():
+        async with client.http_session.get("https://valorant-api.com/v1/maps") as response:
+            response.raise_for_status()
+            return (await response.json()).get("data", [])
+    return await cached("valorant:map-catalog", 7 * 86400, fetch)
+
+
+async def map_background_path(map_uuid, map_name="Unknown"):
+    """Fetch map splash art into the same cache path used by match-feed cards."""
+    path = ICON_DIR / f"map_{map_uuid}.jpg"
+    if path.exists():
+        return path
+    try:
+        async with client.http_session.get(f"https://valorant-api.com/v1/maps/{map_uuid}") as response:
+            response.raise_for_status()
+            map_info = (await response.json()).get("data", {})
+        image_url = map_info.get("splash") or map_info.get("listViewIcon")
+        if image_url:
+            async with client.http_session.get(image_url) as response:
+                response.raise_for_status()
+                path.write_bytes(await response.read())
+    except Exception as exc:
+        print(f"Map art unavailable for {map_name}: {exc}")
+        return None
+    return path if path.exists() else None
+
+
+def draw_schedule_card(season, map_art, today, match_times=""):
+    weeks = season.get("weeks", [])
+    width, margin, row_gap, row_height = 1200, 28, 9, 126
+    header_height = 142
+    note = (season.get("note") or "").strip()
+    footer_font = match_font(17)
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    footer_lines = _wrap_image_text(measure, match_times, footer_font, width - margin * 2, 3) if match_times else []
+    note_lines = _wrap_image_text(measure, note, match_font(15), width - margin * 2, 2) if note else []
+    footer_height = 30 + len(footer_lines) * 25 + len(note_lines) * 22 if footer_lines or note_lines else 24
+    height = header_height + len(weeks) * (row_height + row_gap) + footer_height + 20
+    image = Image.new("RGB", (width, height), (17, 16, 20))
+    draw = ImageDraw.Draw(image)
+    coral = (241, 94, 106)
+    draw.rectangle((0, 0, width, 7), fill=coral)
+    stage = season.get("stage", "Premier")
+    draw.text((margin, 56), "PREMIER SCHEDULE", font=match_font(38, True), fill=(249, 248, 250), anchor="lm")
+    draw.text((width - margin, 58), stage.upper(), font=match_font(21, True), fill=(168, 165, 174), anchor="rm")
+    draw.line((margin, 104, width - margin, 104), fill=(58, 56, 64), width=2)
+
+    marked = False
+    for index, week in enumerate(weeks):
+        y = header_height + index * (row_height + row_gap)
+        start, end = week.get("start", ""), week.get("end", "")
+        if end and end < today:
+            status, accent = "COMPLETE", (139, 136, 145)
+        elif not marked:
+            status, accent = ("CURRENT" if start <= today else "UP NEXT"), ((77, 190, 116) if start <= today else coral)
+            marked = True
+        else:
+            status, accent = "UPCOMING", coral
+        box = (margin, y, width - margin, y + row_height)
+        draw.rectangle(box, fill=(31, 30, 35), outline=(58, 56, 64), width=1)
+        map_name = week.get("map", "Unknown")
+        map_path = map_art.get(map_name.casefold())
+        if map_path and Path(map_path).exists():
+            try:
+                with Image.open(map_path) as source:
+                    background = ImageOps.fit(source.convert("RGB"), (width - margin * 2 - 2, row_height - 2), method=Image.Resampling.LANCZOS)
+                overlay = Image.new("RGBA", background.size, (14, 13, 17, 142))
+                background = Image.alpha_composite(background.convert("RGBA"), overlay).convert("RGB")
+                image.paste(background, (margin + 1, y + 1))
+            except OSError:
+                pass
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((margin, y, margin + 7, y + row_height), fill=accent)
+        label = week.get("label", f"Week {index + 1}").upper()
+        draw.text((margin + 28, y + 33), label, font=match_font(15, True), fill=(196, 193, 201), anchor="lm")
+        name_size = 46 if len(map_name) <= 13 else 38
+        draw.text((margin + 28, y + 82), map_name.upper(), font=match_font(name_size, True), fill=(250, 249, 251), anchor="lm")
+        date_text = fmt_range(start, end) if start and end else "Dates to be announced"
+        draw.text((width - margin - 24, y + 48), date_text.upper(), font=match_font(19, True), fill=(246, 244, 247), anchor="rm")
+        draw.text((width - margin - 24, y + 83), status, font=match_font(15, True), fill=accent, anchor="rm")
+
+    footer_y = header_height + len(weeks) * (row_height + row_gap) + 8
+    draw = ImageDraw.Draw(image)
+    if match_times:
+        draw.text((margin, footer_y + 5), "MATCH TIMES", font=match_font(15, True), fill=coral, anchor="lm")
+        for line in footer_lines:
+            footer_y += 25
+            draw.text((margin, footer_y + 5), line, font=footer_font, fill=(216, 214, 220), anchor="lm")
+    if note_lines:
+        footer_y += 28 if match_times else 10
+        for line in note_lines:
+            footer_y += 22
+            draw.text((margin, footer_y), line, font=match_font(15), fill=(151, 148, 158), anchor="lm")
+    return image
+
+
+async def schedule_card_file(season, today, match_times=""):
+    map_art = {}
+    try:
+        catalog = await valorant_map_catalog()
+        by_name = {str(item.get("displayName", "")).casefold(): item for item in catalog}
+        jobs = {}
+        for week in season.get("weeks", []):
+            map_name = week.get("map", "")
+            info = by_name.get(map_name.casefold())
+            map_uuid = (info or {}).get("uuid")
+            if map_uuid:
+                jobs[map_name.casefold()] = map_background_path(map_uuid, map_name)
+        paths = await asyncio.gather(*jobs.values()) if jobs else []
+        map_art = dict(zip(jobs.keys(), paths))
+    except Exception as exc:
+        print(f"Schedule map art unavailable: {exc}")
+    loop = asyncio.get_running_loop()
+    image = await loop.run_in_executor(None, draw_schedule_card, season, map_art, today, match_times)
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    buffer.seek(0)
+    return discord.File(buffer, filename="premier-schedule.png")
+
+
+@tree.command(name="schedule", description="Premier map schedule and match times")
 async def schedule(interaction: discord.Interaction):
     await interaction.response.defer()
     season = load_season()
-    embed = discord.Embed(title=f"Premier schedule{' ' + season['stage'] if season else ''}", colour=0xFF4655)
-
-    if season:
-        today = datetime.now(timezone.utc).date().isoformat()
-        marked = False
-        lines = []
-        for w in season["weeks"]:
-            if w["end"] < today:
-                icon = "\u2705"
-            elif not marked:
-                icon = "\u25b6\ufe0f" if w["start"] <= today else "\u23ed\ufe0f"
-                marked = True
-            else:
-                icon = "\u25ab\ufe0f"
-            lines.append(f"{icon} **{w['label']}: {w['map']}** ({fmt_range(w['start'], w['end'])})")
-        embed.description = "\n".join(lines)
-        if season.get("note"):
-            embed.set_footer(text=season["note"])
-    else:
-        embed.description = "No season.json found."
+    if not season:
+        return await interaction.followup.send("No season schedule is configured.")
 
     # Match times: your /setschedule text, or the latest tweet, whichever is newer
     manual = load_manual_schedule()
@@ -683,23 +787,22 @@ async def schedule(interaction: discord.Interaction):
         tweet = None
     tweet_time = parse_time(tweet["created_at"]) if tweet else None
     manual_time = parse_time(manual["set_at"]) if manual else None
+    match_times, source_url = "", None
     if manual and (not tweet_time or manual_time > tweet_time):
-        embed.add_field(
-            name="Match times",
-            value=f"{manual['text']}\nSet by {manual['set_by']} {ts(manual_time, 'R')}",
-            inline=False,
-        )
+        match_times = f"{manual['text']} · set by {manual['set_by']}"
     elif tweet:
-        link = f"https://x.com/{X_USERNAME}/status/{tweet['id']}"
-        embed.add_field(name="Latest post", value=f"{tweet['text'][:900]}\n[View on X]({link})", inline=False)
+        match_times = tweet["text"]
+        source_url = f"https://x.com/{X_USERNAME}/status/{tweet['id']}"
 
-    await interaction.followup.send(embed=embed)
+    today = datetime.now(timezone.utc).date().isoformat()
+    card = await schedule_card_file(season, today, match_times)
+    await interaction.followup.send(content=f"[Official match-time post]({source_url})" if source_url else None, file=card)
 
 
 @tree.command(name="setschedule", description="Set Premier times and/or weekly queue reminders")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    text="Optional schedule text for /schedule, e.g. Wed 8pm Ascent",
+    text="Optional match-time text shown on the /schedule image, e.g. Wed 8pm Ascent",
     days="Queue days, comma-separated (e.g. Tuesday,Thursday)",
     local_time="Queue start time in 24-hour HH:MM format",
     timezone_name="IANA time zone (e.g. Europe/London or America/Los_Angeles)",
@@ -1117,6 +1220,17 @@ def save_matchfeeds(feeds):
     MATCHFEEDS_FILE.write_text(json.dumps(feeds, indent=1))
 
 
+def load_rank_states():
+    try:
+        return json.loads(RANKSTATES_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_rank_states(states):
+    RANKSTATES_FILE.write_text(json.dumps(states, indent=1))
+
+
 @tree.command(name="play", description="Start or stop tracking a Valorant queue session")
 @app_commands.describe(action="Start tracking or stop your active session", players="Optional queued players, as @mentions")
 @app_commands.choices(action=[app_commands.Choice(name="Start", value="start"), app_commands.Choice(name="Stop", value="stop")])
@@ -1149,7 +1263,7 @@ async def play_cmd(interaction: discord.Interaction, action: app_commands.Choice
                                             allowed_mentions=discord.AllowedMentions.none())
 
 
-@tree.command(name="matchfeed", description="Set this server's automatic Valorant match report channel")
+@tree.command(name="matchfeed", description="Set this server's automatic Valorant match and rank report channel")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(channel="Channel for match reports; leave blank to disable")
 async def matchfeed_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
@@ -1175,7 +1289,7 @@ async def matchfeed_cmd(interaction: discord.Interaction, channel: discord.TextC
         feeds[guild_key] = existing
     save_matchfeeds(feeds)
     await interaction.response.send_message(
-        f"Automatic match reports will post in {channel.mention} for each new competitive match involving a registered account. Registered players on the same team are combined into one post.",
+        f"Automatic match reports will post in {channel.mention} for each new competitive match involving a registered account. Same-team players are combined into one post, and rank changes are announced there too.",
         ephemeral=True,
     )
 
@@ -1246,6 +1360,9 @@ async def matchfeed_loop():
         cycle_started = loop.time()
         feeds = load_matchfeeds()
         accounts = load_accounts()
+        rank_states = load_rank_states()
+        rank_state_updates = {}
+        rank_changes = []
         try:
             if feeds and accounts:
                 linked = {}
@@ -1263,7 +1380,40 @@ async def matchfeed_loop():
                     account = entry["account"]
                     region = account.get("region") or AFFINITY
                     if request_count:
-                        await asyncio.sleep(2.3)  # leave room under the basic API rate limit
+                        await asyncio.sleep(2.3)  # pace all Riot API calls below the basic rate limit
+                    request_count += 1
+
+                    try:
+                        rank_data = await cached_api(
+                            f"/valorant/v3/mmr/{region}/pc/{quote(account['name'])}/{quote(account['tag'])}",
+                            240,
+                        )
+                        current = (rank_data.get("current") or {}) if isinstance(rank_data, dict) else {}
+                        tier = current.get("tier") or {}
+                        if not tier:
+                            raise ValueError("Rank response did not include a current tier")
+                        tier_id = int(tier.get("id") or 0)
+                        tier_name = tier.get("name") or "Unrated"
+                        previous = rank_states.get(riot_key)
+                        if previous is None:
+                            rank_state_updates[riot_key] = {"tier_id": tier_id, "tier_name": tier_name}
+                        elif int(previous.get("tier_id") or 0) != tier_id:
+                            rank_changes.append({
+                                "riot_key": riot_key,
+                                "user_ids": sorted(entry["user_ids"]),
+                                "name": account["name"],
+                                "from_id": int(previous.get("tier_id") or 0),
+                                "from_name": previous.get("tier_name") or "Unrated",
+                                "to_id": tier_id,
+                                "to_name": tier_name,
+                                "direction": "up" if tier_id > int(previous.get("tier_id") or 0) else "down",
+                            })
+                            rank_state_updates[riot_key] = {"tier_id": tier_id, "tier_name": tier_name}
+                    except Exception as exc:
+                        print(f"Match feed rank check failed for {account['name']}#{account['tag']}: {exc}")
+
+                    if request_count:
+                        await asyncio.sleep(2.3)
                     request_count += 1
                     try:
                         history = await cached_api(
@@ -1272,7 +1422,7 @@ async def matchfeed_loop():
                         )
                     except Exception as exc:
                         print(f"Match feed history failed for {account['name']}#{account['tag']}: {exc}")
-                        continue
+                        history = []
                     for item in history or []:
                         meta = item.get("meta") or {}
                         match_id = meta.get("id")
@@ -1368,7 +1518,7 @@ async def matchfeed_loop():
                                         member_account_keys.add(riot_key)
                                         mentions.append(user_id)
                             if member_account_keys:
-                                guild_groups.append((team_id, group, list(dict.fromkeys(mentions))))
+                                guild_groups.append((team_id, group, list(dict.fromkeys(mentions)), member_account_keys))
                         if not guild_groups:
                             feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
                             save_matchfeeds(feeds)
@@ -1377,25 +1527,31 @@ async def matchfeed_loop():
                             len(item[1]["account_keys"]),
                             bool(team_records.get(item[0], {}).get("won")),
                         ), reverse=True)
-                        team_id, group, mentions = guild_groups[0]
+                        team_id, group, mentions, member_account_keys = guild_groups[0]
                         team_record = team_records.get(team_id, {})
                         rounds = team_record.get("rounds") or {}
                         score = f"{rounds.get('won', 0)}-{rounds.get('lost', 0)}"
                         result_word = "won" if team_record.get("won") else "lost"
                         all_team_players = [p for p in detail.get("players", []) if str(p.get("team_id")) == team_id]
+                        registered_players = [
+                            p for p in group["players"]
+                            if f"{p.get('name', '')}#{p.get('tag', '')}".casefold() in member_account_keys
+                        ]
                         mention_text = " ".join(f"<@{user_id}>" for user_id in mentions)
-                        notify_targets.append((guild_key, feed, channel, mention_text, team_id, all_team_players, result_word, score))
+                        notify_targets.append((guild_key, feed, channel, mention_text, team_id,
+                                               registered_players, all_team_players, result_word, score))
 
                     if notify_targets:
-                        cards_by_team = {}
-                        for guild_key, feed, channel, mention_text, team_id, all_team_players, result_word, score in notify_targets:
+                        cards_by_roster = {}
+                        for guild_key, feed, channel, mention_text, team_id, registered_players, all_team_players, result_word, score in notify_targets:
                             try:
-                                if team_id not in cards_by_team:
-                                    card = await play_match_image(detail, all_team_players, all_team_players, all_team_players[0])
-                                    cards_by_team[team_id] = card.fp.getvalue()
+                                roster_key = (team_id, tuple(p.get("puuid") for p in registered_players))
+                                if roster_key not in cards_by_roster:
+                                    card = await play_match_image(detail, registered_players, all_team_players, registered_players[0])
+                                    cards_by_roster[roster_key] = card.fp.getvalue()
                                 await channel.send(
                                     content=f"{mention_text} {result_word} {score} on {map_name}!",
-                                    file=discord.File(io.BytesIO(cards_by_team[team_id]), filename="match.png"),
+                                    file=discord.File(io.BytesIO(cards_by_roster[roster_key]), filename="match.png"),
                                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                                 )
                             except discord.HTTPException as exc:
@@ -1403,6 +1559,47 @@ async def matchfeed_loop():
                                 continue
                             feed["seen"] = (list(feed.get("seen", [])) + [str(match_id)])[-1000:]
                             save_matchfeeds(feeds)
+
+                for event in rank_changes:
+                    try:
+                        card = await rank_change_image(
+                            event["name"], event["from_id"], event["from_name"],
+                            event["to_id"], event["to_name"], event["direction"],
+                        )
+                        image_bytes = card.fp.getvalue()
+                    except Exception as exc:
+                        print(f"Could not render rank change card for {event['name']}: {exc}")
+                        continue
+                    for guild_key, feed in feeds.items():
+                        guild = client.get_guild(int(guild_key))
+                        if guild is None:
+                            continue
+                        matching_users = []
+                        for user_id in event["user_ids"]:
+                            if await guild_member(guild, user_id):
+                                matching_users.append(user_id)
+                        if not matching_users:
+                            continue
+                        channel = client.get_channel(int(feed.get("channel_id", 0)))
+                        if channel is None:
+                            try:
+                                channel = await client.fetch_channel(int(feed["channel_id"]))
+                            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                                print(f"Could not resolve rank feed channel for guild {guild_key}: {exc}")
+                                continue
+                        direction_text = "ranked up" if event["direction"] == "up" else "deranked"
+                        mention_text = " ".join(f"<@{user_id}>" for user_id in matching_users)
+                        try:
+                            await channel.send(
+                                content=f"{mention_text} {direction_text}: **{event['from_name']} → {event['to_name']}**!",
+                                file=discord.File(io.BytesIO(image_bytes), filename="rank-change.png"),
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                            )
+                        except discord.HTTPException as exc:
+                            print(f"Could not post rank change for {event['name']} in guild {guild_key}: {exc}")
+                if rank_state_updates:
+                    rank_states.update(rank_state_updates)
+                    save_rank_states(rank_states)
         except Exception as exc:
             print(f"Match feed poll failed: {exc}")
         await asyncio.sleep(max(1, 300 - (loop.time() - cycle_started)))
@@ -1759,21 +1956,8 @@ def _clutch_wins(detail, players):
 async def play_match_image(detail, queued_players, all_teammates, representative):
     map_data = (detail.get("metadata", {}).get("map") or {})
     map_uuid = map_data.get("id") or map_data.get("uuid")
-    path = ICON_DIR / f"map_{map_uuid}.jpg" if map_uuid else None
     map_name = map_data.get("name", "Unknown")
-    if map_uuid:
-        try:
-            if not path.exists():
-                async with client.http_session.get(f"https://valorant-api.com/v1/maps/{map_uuid}") as response:
-                    response.raise_for_status()
-                    map_info = (await response.json()).get("data", {})
-                image_url = map_info.get("splash") or map_info.get("listViewIcon")
-                if image_url:
-                    async with client.http_session.get(image_url) as response:
-                        response.raise_for_status()
-                        path.write_bytes(await response.read())
-        except Exception as exc:
-            print(f"Map art unavailable for {map_name}: {exc}")
+    path = await map_background_path(map_uuid, map_name) if map_uuid else None
     raw_agents = [p.get("agent") or p.get("character") or {} for p in queued_players]
     needs_catalog = any(
         not ((agent.get("id") or agent.get("uuid")) if isinstance(agent, dict) else "")
@@ -1828,6 +2012,50 @@ async def play_match_image(detail, queued_players, all_teammates, representative
     return discord.File(buffer, filename="match.png")
 
 
+async def rank_change_image(player_name, from_id, from_name, to_id, to_name, direction):
+    """Build a rank-change card in the same dark, coral-accented style as match cards."""
+    try:
+        tier_icons = (await icon_maps()).get("tiers", {})
+    except Exception as exc:
+        print(f"Rank icon catalog unavailable: {exc}")
+        tier_icons = {}
+    old_icon, new_icon = await asyncio.gather(
+        icon_img(tier_icons.get(str(from_id)), 132),
+        icon_img(tier_icons.get(str(to_id)), 132),
+    )
+
+    image = Image.new("RGB", (1200, 500), (17, 16, 20))
+    draw = ImageDraw.Draw(image)
+    accent = (77, 190, 116) if direction == "up" else (224, 86, 99)
+    draw.rounded_rectangle((22, 22, 1178, 478), radius=18, fill=(28, 27, 32), outline=(57, 55, 63), width=2)
+    draw.text((58, 70), "RANK UP" if direction == "up" else "DERANK", font=match_font(38, True), fill=accent, anchor="lm")
+    draw.text((1140, 70), player_name, font=match_font(27, True), fill=(245, 244, 247), anchor="rm")
+    draw.line((58, 108, 1142, 108), fill=(58, 56, 64), width=2)
+
+    panels = ((60, 148, 530, 425), (670, 148, 1140, 425))
+    for panel in panels:
+        draw.rounded_rectangle(panel, radius=12, fill=(34, 33, 39), outline=(61, 59, 67), width=1)
+    draw.text((295, 178), "FROM", font=match_font(16, True), fill=(154, 151, 161), anchor="mm")
+    draw.text((905, 178), "TO", font=match_font(16, True), fill=(154, 151, 161), anchor="mm")
+
+    def paste_tier_icon(icon, center_x):
+        if icon is None:
+            return
+        icon = ImageOps.contain(icon.convert("RGBA"), (132, 132), method=Image.Resampling.LANCZOS)
+        image.paste(icon, (center_x - icon.width // 2, 202 + (132 - icon.height) // 2), icon)
+
+    paste_tier_icon(old_icon, 295)
+    paste_tier_icon(new_icon, 905)
+    draw.text((295, 365), from_name.upper(), font=match_font(27, True), fill=(218, 216, 222), anchor="mm")
+    draw.text((905, 365), to_name.upper(), font=match_font(27, True), fill=(250, 249, 251), anchor="mm")
+    draw.text((600, 282), "→", font=match_font(48, True), fill=accent, anchor="mm")
+    draw.text((600, 441), "SUBRANKS AND FULL TIER PROMOTIONS COUNT", font=match_font(14, True), fill=(151, 148, 158), anchor="mm")
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    buffer.seek(0)
+    return discord.File(buffer, filename="rank-change.png")
+
+
 @tree.command(name="testplaycard", description="Preview a sample play-session match card (administrators only)")
 @app_commands.default_permissions(administrator=True)
 async def test_play_card(interaction: discord.Interaction):
@@ -1875,6 +2103,28 @@ async def test_play_card(interaction: discord.Interaction):
         "kills": kills,
     }
     card = await play_match_image(detail, [kevin, spam], [kevin, spam], kevin)
+    await interaction.followup.send(file=card, ephemeral=True)
+
+
+@tree.command(name="testrankcard", description="Preview a rank change image (administrators only)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(scenario="Choose a subrank promotion, full-rank promotion, or derank preview")
+@app_commands.choices(scenario=[
+    app_commands.Choice(name="Subrank promotion: Platinum 1 → Platinum 2", value="subrank"),
+    app_commands.Choice(name="Full promotion: Platinum 3 → Diamond 1", value="promotion"),
+    app_commands.Choice(name="Derank: Diamond 1 → Platinum 3", value="derank"),
+])
+async def test_rank_card(interaction: discord.Interaction, scenario: app_commands.Choice[str]):
+    if not interaction.guild or not interaction.permissions.administrator:
+        return await interaction.response.send_message("Only server administrators can use this command.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    previews = {
+        "subrank": (15, "Platinum 1", 16, "Platinum 2", "up"),
+        "promotion": (17, "Platinum 3", 18, "Diamond 1", "up"),
+        "derank": (18, "Diamond 1", 17, "Platinum 3", "down"),
+    }
+    from_id, from_name, to_id, to_name, direction = previews[scenario.value]
+    card = await rank_change_image(interaction.user.display_name, from_id, from_name, to_id, to_name, direction)
     await interaction.followup.send(file=card, ephemeral=True)
 
 
@@ -2620,7 +2870,7 @@ for _cmd in (agent_cmd, assignagent, lineup, clearagent):
 HELP_SECTIONS = [
     ("Premier", ["schedule", "results", "mapresults", "scout", "agent", "lineup", "clearagent", "playbook"]),
     ("Players", ["register", "unregister", "accounts", "rank", "player", "recent", "play"]),
-    ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "testplaycard", "clearcache"]),
+    ("Server managers", ["assignagent", "createplaybook", "setschedule", "testreminder", "testplaycard", "testrankcard", "clearcache"]),
     ("Troubleshooting", ["findteam", "debug"]),
 ]
 

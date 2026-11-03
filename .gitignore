@@ -1,2 +1,3 @@
-.env
-matchfeeds.json
+/*
+!/bot.py
+!/env.example
