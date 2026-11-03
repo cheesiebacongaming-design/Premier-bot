@@ -36,8 +36,8 @@ class Settings:
     rankstates_file: Path
     icon_dir: Path
     font_dir: Path
-    gemini_api_key: Optional[str]
-    gemini_model: str
+    groq_api_key: Optional[str]
+    groq_model: str
 
 
 def load_settings(environ=None) -> Settings:
@@ -87,8 +87,8 @@ def load_settings(environ=None) -> Settings:
         rankstates_file=Path("rankstates.json"),
         icon_dir=Path("icons"),
         font_dir=Path(__file__).resolve().parent / "assets" / "fonts",
-        gemini_api_key=(environ.get("GEMINI_API_KEY") or "").strip() or None,
-        gemini_model=(environ.get("GEMINI_MODEL") or "gemini-3.8-flash").strip(),
+        groq_api_key=(environ.get("GROQ_API_KEY") or "").strip() or None,
+        groq_model=(environ.get("GROQ_MODEL") or "qwen/qwen3.8-27b").strip(),
     )
 
 

@@ -29,8 +29,8 @@ files. Configure automatic reports with `/matchfeed` in the target server.
 | --- | --- |
 | `DISCORD_TOKEN` | Required Discord bot token |
 | `HENRIK_API_KEY` | Required HenrikDev API key |
-| `GEMINI_API_KEY` | Optional Google Gemini API key for AI match recaps |
-| `GEMINI_MODEL` | Optional recap model; defaults to `gemini-3.8-flash` |
+| `GROQ_API_KEY` | Optional Groq API key for AI match recaps |
+| `GROQ_MODEL` | Optional recap model; defaults to `qwen/qwen3.8-27b` |
 | `TEAM_ID` | Preferred Premier team identifier |
 | `TEAM_NAME`, `TEAM_TAG` | Team lookup when no ID is configured |
 | `ROSTER` | Optional comma-separated `Name#Tag` entries for history fallback |
@@ -42,8 +42,7 @@ files. Configure automatic reports with `/matchfeed` in the target server.
 Keep `.env` private. The older `env.example` is retained for existing installs.
 No Discord or API credentials are required by the unit tests.
 When AI recaps are enabled, player names, match statistics, and kill events are
-sent to Google Gemini. Google may use free-tier content to improve its products.
-Free-tier limits vary by model and project; paid-tier usage can incur charges.
+sent to Groq. Free-tier limits vary by model and account; paid-tier usage can incur charges.
 If no key is set or a request fails, a local recap is used.
 
 ## Deployment on Ubuntu / AWS
