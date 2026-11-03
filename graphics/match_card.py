@@ -9,6 +9,21 @@ from utils.formatting import parse_time
 from utils.match_summary import _clutch_wins, _deaths_by_round, _play_headline, _play_recap
 
 
+def _assign_unique_tags(tracked):
+    """Give each tag to one eligible player, balancing tied awards across cards."""
+    candidates = {}
+    for index, item in enumerate(tracked):
+        for tag in item["tags"]:
+            candidates.setdefault(tag.split(" x", 1)[0], []).append((index, tag))
+    assigned = [[] for _ in tracked]
+    # Settle uncontested awards before using the current award count for ties.
+    for group in sorted(candidates.values(), key=len):
+        index, tag = min(group, key=lambda candidate: (len(assigned[candidate[0]]), candidate[0]))
+        assigned[index].append(tag)
+    for item, tags in zip(tracked, assigned):
+        item["tags"] = tags
+
+
 def draw_play_result(detail, queued_players, all_teammates, representative, map_path, ai_recap=None):
     meta = detail.get("metadata", {})
     teams = {t.get("team_id"): t for t in detail.get("teams", [])}
@@ -44,8 +59,9 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     for p in all_teammates:
         st = p.get("stats", {})
         stats_by_id[p.get("puuid")] = st
-    team_mvp_id = max(stats_by_id, key=lambda puuid: stats_by_id[puuid].get("score", 0)) if stats_by_id else None
-    team_lvp_id = min(stats_by_id, key=lambda puuid: stats_by_id[puuid].get("score", 0)) if stats_by_id else None
+    scores = [stats.get("score", 0) for stats in stats_by_id.values()]
+    top_score = max(scores) if scores else None
+    low_score = min(scores) if scores else None
     round_count = max(our_score + their_score, 1)
     deaths_by_round = _deaths_by_round(detail)
     clutch_wins = _clutch_wins(detail, all_teammates)
@@ -56,6 +72,14 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
     }
     most_assists = max(assists_by_id.values(), default=0)
     highest_adr = max(damage_by_id.values(), default=0)
+    most_first_bloods = max((first_bloods.get(p.get("puuid"), 0) for p in all_teammates), default=0)
+    headshot_rates = {}
+    for player in all_teammates:
+        stats = player.get("stats") or {}
+        shots = sum(stats.get(part, 0) for part in ("headshots", "bodyshots", "legshots"))
+        if stats.get("kills", 0) >= 15 and shots:
+            headshot_rates[player.get("puuid")] = round(stats.get("headshots", 0) * 100 / shots)
+    highest_hs = max(headshot_rates.values(), default=0)
     lowest_deaths = min(((p.get("stats") or {}).get("deaths", 0) for p in all_teammates), default=0)
     tracked = []
     for p in queued_players:
@@ -67,9 +91,9 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
         best_round = max((kills_per_round.get(r, {}).get(puuid, 0) for r in kills_per_round), default=0)
         if best_round >= 5: tags.append("ACE")
         elif best_round == 4: tags.append("QUAD")
-        if puuid == team_mvp_id: tags.append("MVP")
-        if first_bloods.get(puuid, 0) >= 3: tags.append("ENTRY")
-        if st.get("kills", 0) >= 15 and hs >= 30: tags.append("DINK MACHINE")
+        if top_score is not None and st.get("score", 0) == top_score: tags.append("MVP")
+        if most_first_bloods >= 3 and first_bloods.get(puuid, 0) == most_first_bloods: tags.append("ENTRY")
+        if highest_hs >= 30 and headshot_rates.get(puuid) == highest_hs: tags.append("DINK MACHINE")
         if most_assists >= 8 and assists_by_id.get(puuid, 0) == most_assists: tags.append("ASSIST KING")
         if highest_adr >= 160 and damage_by_id.get(puuid, 0) == highest_adr: tags.append("DAMAGE DEALER")
         if round_count >= 10 and ((st.get("deaths", 0) / round_count) <= 0.45) and st.get("deaths", 0) == lowest_deaths:
@@ -80,11 +104,12 @@ def draw_play_result(detail, queued_players, all_teammates, representative, map_
             tags.append(f"CLUTCH x{clutch_count}")
         death_rounds = sum(1 for events in deaths_by_round.values() if events.get(puuid, 0) > 0)
         if round_count > 0 and death_rounds >= round_count: tags.append("VICTIM")
-        if puuid == team_lvp_id: tags.append("LVP")
+        if low_score is not None and st.get("score", 0) == low_score: tags.append("LVP")
         tracked.append({"p": p, "st": st, "hs": hs, "tags": tags,
                         "fb": first_bloods.get(puuid, 0), "fd": first_deaths.get(puuid, 0),
                         "adr": damage_by_id.get(puuid, 0)})
 
+    _assign_unique_tags(tracked)
     width, hero_h, gap = 1200, 270, 18
     recap = (ai_recap or {}).get("recap") or _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration, detail)
     headline = ((ai_recap or {}).get("headline") or _play_headline(all_teammates, our_score, their_score)).upper()

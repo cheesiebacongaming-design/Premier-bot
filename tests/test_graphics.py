@@ -3,7 +3,7 @@ from io import BytesIO
 from PIL import Image
 
 from graphics.lineup import render_lineup_card
-from graphics.match_card import draw_play_result
+from graphics.match_card import _assign_unique_tags, draw_play_result
 from graphics.rank_change import draw_rank_change_card
 from graphics.schedule import render_schedule_card
 
@@ -12,6 +12,20 @@ def _png_size(buffer):
     with Image.open(BytesIO(buffer.getvalue())) as image:
         assert image.format == "PNG"
         return image.size
+
+
+def test_tied_tags_go_to_eligible_player_with_fewer_awards():
+    players = [
+        {"tags": ["MVP", "ASSIST KING", "CLUTCH x1"]},
+        {"tags": ["ASSIST KING", "CLUTCH x1"]},
+        {"tags": ["LVP"]},
+    ]
+
+    _assign_unique_tags(players)
+
+    assert players[0]["tags"] == ["MVP", "CLUTCH x1"]
+    assert players[1]["tags"] == ["ASSIST KING"]
+    assert players[2]["tags"] == ["LVP"]
 
 
 def test_schedule_renderer_returns_png_without_external_art():

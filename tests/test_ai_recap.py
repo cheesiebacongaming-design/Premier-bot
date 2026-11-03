@@ -1,6 +1,6 @@
 import pytest
 
-from services.ai_recap import generate_recap
+from services.ai_recap import generate_recap, recap_facts
 
 
 class FakeResponse:
@@ -59,3 +59,16 @@ async def test_invalid_generated_fields_fall_back():
         "content": {"parts": [{"text": '{"headline":"", "recap":"Some recap."}'}]}}]}))
 
     assert await generate_recap(session, "test-key", "model", {}, [], {}) is None
+
+
+def test_match_and_round_times_are_converted_to_seconds():
+    detail = {"metadata": {"game_length_in_ms": 1_980_000}, "kills": [
+        {"round": 0, "time_in_round_in_ms": 12_500, "killer": {}, "victim": {}},
+        {"round": 1, "time_in_round_in_ms": None, "killer": {}, "victim": {}},
+    ]}
+
+    facts = recap_facts(detail, [], {})
+
+    assert facts["duration_seconds"] == 1980
+    assert facts["kill_events"][0]["time_in_round_seconds"] == 12.5
+    assert facts["kill_events"][1]["time_in_round_seconds"] is None
