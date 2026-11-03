@@ -26,6 +26,7 @@ from graphics.scoreboard import draw_scoreboard
 from services.cache import JsonCache
 from services.json_store import JsonStoreError, read_json, write_json
 from services.match_history import MatchHistoryService
+from services.matchfeed import format_match_notification, group_registered_players
 from services.valorant_api import HenrikDevClient
 from utils.formatting import fmt_range, parse_time
 from utils.statistics import summarise_match
@@ -1109,17 +1110,7 @@ async def matchfeed_loop():
                         print(f"Match feed detail failed for {match_id}: {exc}")
                         continue
 
-                    team_groups = {}
-                    for player_data in detail.get("players", []):
-                        riot_key = f"{player_data.get('name', '')}#{player_data.get('tag', '')}".casefold()
-                        if riot_key not in linked or not player_data.get("team_id"):
-                            continue
-                        group = team_groups.setdefault(str(player_data["team_id"]), {
-                            "account_keys": set(), "user_ids": set(), "players": [],
-                        })
-                        group["account_keys"].add(riot_key)
-                        group["user_ids"].update(linked[riot_key]["user_ids"])
-                        group["players"].append(player_data)
+                    team_groups = group_registered_players(detail.get("players", []), linked)
 
                     shared_teams = [
                         (team_id, group) for team_id, group in team_groups.items()
@@ -1174,20 +1165,21 @@ async def matchfeed_loop():
                             p for p in group["players"]
                             if f"{p.get('name', '')}#{p.get('tag', '')}".casefold() in member_account_keys
                         ]
-                        mention_text = " ".join(f"<@{user_id}>" for user_id in mentions)
-                        notify_targets.append((guild_key, feed, channel, mention_text, team_id,
+                        notify_targets.append((guild_key, feed, channel, mentions, team_id,
                                                registered_players, all_team_players, result_word, score))
 
                     if notify_targets:
                         cards_by_roster = {}
-                        for guild_key, feed, channel, mention_text, team_id, registered_players, all_team_players, result_word, score in notify_targets:
+                        for guild_key, feed, channel, mentions, team_id, registered_players, all_team_players, result_word, score in notify_targets:
                             try:
                                 roster_key = (team_id, tuple(p.get("puuid") for p in registered_players))
                                 if roster_key not in cards_by_roster:
                                     card = await play_match_image(detail, registered_players, all_team_players, registered_players[0])
                                     cards_by_roster[roster_key] = card.fp.getvalue()
                                 await channel.send(
-                                    content=f"{mention_text} {result_word} {score} on {map_name}!",
+                                    content=format_match_notification(
+                                        mentions, result_word, score, map_name
+                                    ),
                                     file=discord.File(io.BytesIO(cards_by_roster[roster_key]), filename="match.png"),
                                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                                 )
