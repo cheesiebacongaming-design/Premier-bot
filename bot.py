@@ -35,7 +35,6 @@ X_BEARER = os.getenv("X_BEARER_TOKEN")  # optional: read the schedule tweet auto
 X_USERNAME = os.getenv("X_USERNAME")  # account that posts the Premier schedule (no @)
 X_KEYWORD = os.getenv("X_KEYWORD", "premier").lower()  # tweet must contain this
 CACHE_FILE = Path("cache.json")
-SCHEDULE_FILE = Path("schedule.json")
 QUEUE_SCHEDULE_FILE = Path("queue_schedule.json")
 SEASON_FILE = Path("season.json")  # edit this each act
 PLAYBOOK_FILE = Path("playbooks.json")
@@ -624,13 +623,6 @@ async def load_summaries(matches):
 
 
 # ---------- Commands ----------
-def load_manual_schedule():
-    try:
-        return json.loads(SCHEDULE_FILE.read_text())
-    except (FileNotFoundError, ValueError):
-        return None
-
-
 def load_season():
     try:
         return json.loads(SEASON_FILE.read_text())
@@ -679,16 +671,15 @@ async def map_background_path(map_uuid, map_name="Unknown"):
     return path if path.exists() else None
 
 
-def draw_schedule_card(season, map_art, today, match_times=""):
+def draw_schedule_card(season, map_art, today):
     weeks = season.get("weeks", [])
-    width, margin, row_gap, row_height = 1200, 28, 9, 126
-    header_height = 142
+    width, margin, row_gap, row_height = 1200, 28, 8, 118
+    header_height = 128
     note = (season.get("note") or "").strip()
-    footer_font = match_font(17)
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    footer_lines = _wrap_image_text(measure, match_times, footer_font, width - margin * 2, 3) if match_times else []
-    note_lines = _wrap_image_text(measure, note, match_font(15), width - margin * 2, 2) if note else []
-    footer_height = 30 + len(footer_lines) * 25 + len(note_lines) * 22 if footer_lines or note_lines else 24
+    note_font = match_font(23, True)
+    note_lines = _wrap_image_text(measure, note, note_font, width - margin * 2, 2) if note else []
+    footer_height = 46 + len(note_lines) * 31 if note_lines else 20
     height = header_height + len(weeks) * (row_height + row_gap) + footer_height + 20
     image = Image.new("RGB", (width, height), (17, 16, 20))
     draw = ImageDraw.Draw(image)
@@ -706,7 +697,7 @@ def draw_schedule_card(season, map_art, today, match_times=""):
         if end and end < today:
             status, accent = "COMPLETE", (139, 136, 145)
         elif not marked:
-            status, accent = ("CURRENT" if start <= today else "UP NEXT"), ((77, 190, 116) if start <= today else coral)
+            status, accent = ("CURRENT" if start <= today else "UP NEXT"), (77, 190, 116)
             marked = True
         else:
             status, accent = "UPCOMING", coral
@@ -733,22 +724,17 @@ def draw_schedule_card(season, map_art, today, match_times=""):
         draw.text((width - margin - 24, y + 48), date_text.upper(), font=match_font(19, True), fill=(246, 244, 247), anchor="rm")
         draw.text((width - margin - 24, y + 83), status, font=match_font(15, True), fill=accent, anchor="rm")
 
-    footer_y = header_height + len(weeks) * (row_height + row_gap) + 8
+    footer_y = header_height + len(weeks) * (row_height + row_gap) + 9
     draw = ImageDraw.Draw(image)
-    if match_times:
-        draw.text((margin, footer_y + 5), "MATCH TIMES", font=match_font(15, True), fill=coral, anchor="lm")
-        for line in footer_lines:
-            footer_y += 25
-            draw.text((margin, footer_y + 5), line, font=footer_font, fill=(216, 214, 220), anchor="lm")
     if note_lines:
-        footer_y += 28 if match_times else 10
+        draw.text((margin, footer_y + 13), "QUEUE WINDOWS", font=match_font(15, True), fill=coral, anchor="lm")
         for line in note_lines:
-            footer_y += 22
-            draw.text((margin, footer_y), line, font=match_font(15), fill=(151, 148, 158), anchor="lm")
+            footer_y += 31
+            draw.text((margin, footer_y + 12), line, font=note_font, fill=(229, 227, 232), anchor="lm")
     return image
 
 
-async def schedule_card_file(season, today, match_times=""):
+async def schedule_card_file(season, today):
     map_art = {}
     try:
         catalog = await valorant_map_catalog()
@@ -765,44 +751,28 @@ async def schedule_card_file(season, today, match_times=""):
     except Exception as exc:
         print(f"Schedule map art unavailable: {exc}")
     loop = asyncio.get_running_loop()
-    image = await loop.run_in_executor(None, draw_schedule_card, season, map_art, today, match_times)
+    image = await loop.run_in_executor(None, draw_schedule_card, season, map_art, today)
     buffer = io.BytesIO()
     image.save(buffer, "PNG")
     buffer.seek(0)
     return discord.File(buffer, filename="premier-schedule.png")
 
 
-@tree.command(name="schedule", description="Premier map schedule and match times")
+@tree.command(name="schedule", description="View the Premier map schedule")
 async def schedule(interaction: discord.Interaction):
     await interaction.response.defer()
     season = load_season()
     if not season:
         return await interaction.followup.send("No season schedule is configured.")
 
-    # Match times: your /setschedule text, or the latest tweet, whichever is newer
-    manual = load_manual_schedule()
-    try:
-        tweet = await latest_schedule_tweet()
-    except Exception:
-        tweet = None
-    tweet_time = parse_time(tweet["created_at"]) if tweet else None
-    manual_time = parse_time(manual["set_at"]) if manual else None
-    match_times, source_url = "", None
-    if manual and (not tweet_time or manual_time > tweet_time):
-        match_times = f"{manual['text']} · set by {manual['set_by']}"
-    elif tweet:
-        match_times = tweet["text"]
-        source_url = f"https://x.com/{X_USERNAME}/status/{tweet['id']}"
-
     today = datetime.now(timezone.utc).date().isoformat()
-    card = await schedule_card_file(season, today, match_times)
-    await interaction.followup.send(content=f"[Official match-time post]({source_url})" if source_url else None, file=card)
+    card = await schedule_card_file(season, today)
+    await interaction.followup.send(file=card)
 
 
-@tree.command(name="setschedule", description="Set Premier times and/or weekly queue reminders")
+@tree.command(name="setschedule", description="Set weekly queue reminder days and times")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    text="Optional match-time text shown on the /schedule image, e.g. Wed 8pm Ascent",
     days="Queue days, comma-separated (e.g. Tuesday,Thursday)",
     local_time="Queue start time in 24-hour HH:MM format",
     timezone_name="IANA time zone (e.g. Europe/London or America/Los_Angeles)",
@@ -810,7 +780,6 @@ async def schedule(interaction: discord.Interaction):
 )
 async def setschedule(
     interaction: discord.Interaction,
-    text: str = "",
     days: str = "",
     local_time: str = "",
     timezone_name: str = "",
@@ -826,16 +795,10 @@ async def setschedule(
         return await interaction.response.send_message(
             "For reminders, provide days, local_time, and timezone_name together.", ephemeral=True
         )
-    if not text.strip() and not all(supplied):
+    if not all(supplied):
         return await interaction.response.send_message(
-            "Set reminder days, local_time, and timezone_name, or provide schedule text for /schedule.", ephemeral=True
+            "Provide days, local_time, and timezone_name together to configure queue reminders.", ephemeral=True
         )
-
-    now = datetime.now(timezone.utc).isoformat()
-    if text.strip():
-        SCHEDULE_FILE.write_text(json.dumps({
-            "text": text.strip(), "set_by": interaction.user.display_name, "set_at": now,
-        }))
 
     if all(supplied):
         weekdays = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -868,13 +831,11 @@ async def setschedule(
         }
         save_queue_schedules(configs)
 
-    parts = []
-    if text.strip():
-        parts.append("Premier schedule text updated.")
-    if all(supplied):
-        day_names = ", ".join(weekdays[d] for d in sorted(set(day_values)))
-        parts.append(f"Reminders set for {day_names} at {parsed_time.strftime('%H:%M')} {zone.key} in {target.mention}, 30 minutes before queue.")
-    await interaction.response.send_message(" ".join(parts), ephemeral=True)
+    day_names = ", ".join(weekdays[d] for d in sorted(set(day_values)))
+    await interaction.response.send_message(
+        f"Reminders set for {day_names} at {parsed_time.strftime('%H:%M')} {zone.key} in {target.mention}, 30 minutes before queue.",
+        ephemeral=True,
+    )
 
 
 @tree.command(name="testreminder", description="Post a test queue reminder showing agent picks and mentioning picked players (administrators only)")
