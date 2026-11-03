@@ -1,6 +1,7 @@
 """Generate optional match recaps from observed match data."""
 
 import asyncio
+from collections import Counter
 import json
 import logging
 
@@ -21,7 +22,8 @@ def recap_facts(detail, teammates, representative):
     team_id = representative.get("team_id")
     team = next((t for t in detail.get("teams", []) if t.get("team_id") == team_id), {})
     meta = detail.get("metadata") or {}
-    kills = []
+    round_events = {}
+    teammate_ids = {p.get("puuid") for p in teammates if p.get("puuid")}
     events = detail.get("kills") or []
     zero_based = any(event.get("round") == 0 for event in events)
     for event in events:
@@ -29,15 +31,39 @@ def recap_facts(detail, teammates, representative):
         victim = (event.get("victim") or {}).get("puuid")
         round_index = event.get("round")
         round_number = round_index + 1 if zero_based and isinstance(round_index, int) else round_index
-        kills.append({"round": round_number, "time_in_round_seconds": _seconds(event.get("time_in_round_in_ms")),
-                      "killer": names.get(killer, "Unknown"), "victim": names.get(victim, "Unknown")})
+        if not isinstance(round_number, int):
+            continue
+        round_data = round_events.setdefault(round_number, {"first": None, "missing_time": False, "kills": Counter()})
+        seconds = _seconds(event.get("time_in_round_in_ms"))
+        if seconds is None:
+            round_data["missing_time"] = True
+        if seconds is not None and (round_data["first"] is None or seconds < round_data["first"][0]):
+            round_data["first"] = (seconds, killer, victim)
+        if killer in teammate_ids:
+            round_data["kills"][killer] += 1
+    highlights = []
+    for number, round_data in sorted(round_events.items()):
+        item = {"round": number}
+        if round_data["first"] is not None and not round_data["missing_time"]:
+            seconds, killer, victim = round_data["first"]
+            item["first_blood"] = {"seconds": seconds, "killer": names.get(killer, "Unknown"),
+                                   "victim": names.get(victim, "Unknown")}
+        multi = [{"player": names.get(killer, "Unknown"), "kills": count}
+                 for killer, count in round_data["kills"].items() if count >= 3]
+        if multi:
+            item["multikills"] = multi
+        if len(item) > 1:
+            highlights.append(item)
     return {
         "map": (meta.get("map") or {}).get("name"), "duration_seconds": _seconds(meta.get("game_length_in_ms")),
         "team_won": team.get("won"), "rounds": team.get("rounds"),
         "teammates": [{"name": p.get("name"), "agent": (p.get("agent") or {}).get("name")
                        if isinstance(p.get("agent") or {}, dict) else str(p.get("agent")),
-                       "stats": p.get("stats") or {}} for p in teammates],
-        "kill_events": kills,
+                       "stats": {key: (p.get("stats") or {}).get(key) for key in
+                                 ("kills", "deaths", "assists", "score", "headshots", "bodyshots", "legshots")},
+                       "damage_dealt": ((p.get("stats") or {}).get("damage") or {}).get("dealt")}
+                      for p in teammates],
+        "round_highlights": highlights,
     }
 
 
@@ -59,7 +85,7 @@ async def generate_recap(session, api_key, model, detail, teammates, representat
             "Also write a punchy, funny headline of at most 65 characters about the match. "
             "Return a JSON object with string fields headline and recap, without markdown."
         )}, {"role": "user", "content": json.dumps(
-            recap_facts(detail, teammates, representative), ensure_ascii=False
+            recap_facts(detail, teammates, representative), ensure_ascii=False, separators=(",", ":")
         )}],
         "max_completion_tokens": 600,
         "response_format": {"type": "json_object"},

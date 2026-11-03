@@ -92,5 +92,18 @@ def test_match_and_round_times_are_converted_to_seconds():
     facts = recap_facts(detail, [], {})
 
     assert facts["duration_seconds"] == 1980
-    assert facts["kill_events"][0]["time_in_round_seconds"] == 12.5
-    assert facts["kill_events"][1]["time_in_round_seconds"] is None
+    assert facts["round_highlights"][0]["first_blood"]["seconds"] == 12.5
+    assert len(facts["round_highlights"]) == 1
+
+
+def test_round_highlights_summarise_multikills_without_repeating_all_events():
+    player = {"puuid": "p1", "name": "Player", "team_id": "Red"}
+    detail = {"players": [player], "kills": [
+        {"round": 0, "time_in_round_in_ms": time, "killer": {"puuid": "p1"}, "victim": {}}
+        for time in (1000, 2000, 3000, 4000)
+    ]}
+
+    highlights = recap_facts(detail, [player], player)["round_highlights"]
+
+    assert highlights == [{"round": 1, "first_blood": {"seconds": 1.0, "killer": "Player", "victim": "Unknown"},
+                           "multikills": [{"player": "Player", "kills": 4}]}]
