@@ -1413,7 +1413,8 @@ async def test_rank_card(interaction: discord.Interaction, scenario: app_command
 @app_commands.describe(player="Mention a member with a linked account (defaults to you)")
 async def recent_cmd(interaction: discord.Interaction, player: discord.Member = None):
     target = player or interaction.user
-    account = load_accounts().get(str(target.id))
+    accounts = load_accounts()
+    account = accounts.get(str(target.id))
     if not account:
         return await interaction.response.send_message(
             f"{getattr(target, 'display_name', target.name)} needs to link a VALORANT account with /register first.",
@@ -1449,7 +1450,25 @@ async def recent_cmd(interaction: discord.Interaction, player: discord.Member = 
             return await interaction.followup.send("I found the match, but couldn't match the linked account to its scoreboard.")
         team_id = target_player.get("team_id")
         teammates = [p for p in participants if p.get("team_id") == team_id]
-        card = await play_match_image(detail, teammates, teammates, target_player)
+        registered_keys = {f"{account['name']}#{account['tag']}".casefold()}
+        teammate_keys = {f"{p.get('name', '')}#{p.get('tag', '')}".casefold() for p in teammates}
+        if interaction.guild:
+            for user_id, linked_account in accounts.items():
+                key = f"{linked_account.get('name', '')}#{linked_account.get('tag', '')}".casefold()
+                if key not in teammate_keys or key in registered_keys:
+                    continue
+                try:
+                    member = interaction.guild.get_member(int(user_id))
+                    if member is None:
+                        member = await interaction.guild.fetch_member(int(user_id))
+                except (ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+                if member:
+                    registered_keys.add(key)
+        registered_players = [p for p in teammates
+                              if p is target_player or f"{p.get('name', '')}#{p.get('tag', '')}".casefold() in registered_keys]
+        card = await play_match_image(detail, registered_players, teammates, target_player,
+                                      summary_players=registered_players)
         await interaction.followup.send(file=card, allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         await interaction.followup.send(f"Couldn't load the recent match: {str(exc)[:300]}")
