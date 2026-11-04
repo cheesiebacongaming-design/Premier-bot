@@ -1633,6 +1633,11 @@ async def player_cmd(interaction: discord.Interaction, name: str = "", tag: str 
         return await interaction.followup.send(f"No {mode_value} matches found for {name}#{tag}.")
 
     try:
+        mmr = await cached_api(f"/valorant/v3/mmr/{reg}/pc/{quote(name)}/{quote(tag)}", 300)
+    except Exception as exc:
+        print(f"Player rank unavailable: {exc}")
+        mmr = None
+    try:
         catalog = await icon_maps()
     except Exception as exc:
         print(f"Player history agent catalog unavailable: {exc}")
@@ -1649,8 +1654,10 @@ async def player_cmd(interaction: discord.Interaction, name: str = "", tag: str 
             icon_urls[key] = url
     loaded = await asyncio.gather(*(icon_img(url, 68) for url in icon_urls.values()))
     icons = dict(zip(icon_urls, loaded))
+    tier_id = (((mmr or {}).get("current") or {}).get("tier") or {}).get("id")
+    rank_icon = await icon_img(catalog.get("tiers", {}).get(str(tier_id)), 84)
     loop = asyncio.get_running_loop()
-    image = await loop.run_in_executor(None, render_player_history, name, tag, mode_value, rows, icons)
+    image = await loop.run_in_executor(None, render_player_history, name, tag, mode_value, rows, icons, mmr, rank_icon)
     await interaction.followup.send(file=discord.File(image, filename="player-history.png"))
 
 

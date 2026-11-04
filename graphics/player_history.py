@@ -1,6 +1,7 @@
 """Render recent player matches in the matchfeed visual style."""
 
 from datetime import timezone
+import re
 
 from PIL import Image, ImageDraw, ImageOps
 
@@ -26,7 +27,25 @@ def _fit(draw, text, font, width):
     return text.rstrip() + "..."
 
 
-def render_player_history(name, tag, mode, rows, icons):
+def rank_summary(mmr):
+    """Extract the latest identifiable competitive act without assuming API order."""
+    mmr = mmr if isinstance(mmr, dict) else {}
+    current = mmr.get("current") or {}
+    seasonal = mmr.get("seasonal") or []
+    def season_key(item):
+        short = str((item.get("season") or {}).get("short") or "")
+        numbers = re.findall(r"\d+", short)
+        return tuple(int(number) for number in numbers) if numbers else ()
+    acts = [item for item in seasonal if isinstance(item, dict) and season_key(item)]
+    act = max(acts, key=season_key) if acts else {}
+    wins, games = act.get("wins"), act.get("games")
+    return {"rank": (current.get("tier") or {}).get("name") or ("Unrated" if mmr else "Unavailable"),
+            "tier_id": (current.get("tier") or {}).get("id"), "rr": current.get("rr"),
+            "act": str((act.get("season") or {}).get("short") or "").upper(),
+            "wins": wins, "games": games}
+
+
+def render_player_history(name, tag, mode, rows, icons, mmr=None, rank_icon=None):
     """Draw one dated row per match; icons are preloaded Pillow images."""
     width, pad, row_h = 1200, 24, 96
     groups = []
@@ -35,7 +54,7 @@ def render_player_history(name, tag, mode, rows, icons):
         if not groups or groups[-1][0] != date:
             groups.append((date, []))
         groups[-1][1].append((row, clock))
-    height = 248 + sum(46 + len(items) * (row_h + 10) for _, items in groups) + 20
+    height = 410 + sum(46 + len(items) * (row_h + 10) for _, items in groups) + 20
     image = Image.new("RGB", (width, height), (17, 17, 22))
     draw = ImageDraw.Draw(image)
     white, muted, blue, coral = (247, 246, 248), (160, 157, 168), (164, 194, 245), (240, 99, 106)
@@ -51,14 +70,34 @@ def render_player_history(name, tag, mode, rows, icons):
     summaries = [("RECORD", f"{wins}W / {losses}L"), ("K/D", f"{kills / max(deaths, 1):.2f}"),
                  ("AVG ACS", str(average("acs"))), ("AVG ADR", str(average("adr"))),
                  ("AVG HS", f"{average('hs')}%")]
-    draw.rounded_rectangle((pad, 140, width - pad, 215), radius=9, fill=(28, 27, 32), outline=(51, 49, 56))
+    rank = rank_summary(mmr)
+    draw.rounded_rectangle((pad, 138, width - pad, 255), radius=9, fill=(28, 27, 32), outline=(51, 49, 56))
+    if rank_icon:
+        badge = ImageOps.contain(rank_icon.convert("RGBA"), (84, 84), method=Image.Resampling.LANCZOS)
+        image.paste(badge, (pad + 16 + (84 - badge.width) // 2, 154 + (84 - badge.height) // 2), badge)
+    draw.text((pad + 112, 163), "CURRENT RANK", font=label, fill=muted, anchor="lt")
+    draw.text((pad + 112, 191), _fit(draw, rank["rank"], value, 260), font=value, fill=white, anchor="lt")
+    rr = f"{rank['rr']} RR" if rank["rr"] is not None else "—"
+    draw.text((470, 163), "RANK RATING", font=label, fill=muted, anchor="lt")
+    draw.text((470, 191), rr, font=value, fill=white, anchor="lt")
+    act_label = f"{rank['act']} · LATEST ACT" if rank["act"] else "ACT STATS UNAVAILABLE"
+    draw.text((700, 163), act_label, font=label, fill=muted, anchor="lt")
+    wins_act, games_act = rank["wins"], rank["games"]
+    if isinstance(wins_act, int) and isinstance(games_act, int) and 0 <= wins_act <= games_act:
+        act_record = f"{wins_act} W / {games_act} GAMES  ·  {round(100 * wins_act / games_act) if games_act else 0}% WIN"
+    else:
+        act_record = "—"
+    draw.text((700, 191), act_record, font=value, fill=white, anchor="lt")
+
+    draw.text((pad, 271), f"LAST {len(rows)} {mode.upper()} MATCHES", font=label, fill=muted, anchor="lt")
+    draw.rounded_rectangle((pad, 302, width - pad, 377), radius=9, fill=(28, 27, 32), outline=(51, 49, 56))
     cell = (width - 2 * pad) / len(summaries)
     for index, (heading, text) in enumerate(summaries):
         x = pad + cell * (index + 0.5)
-        draw.text((x, 159), heading, font=label, fill=muted, anchor="mm")
-        draw.text((x, 189), text, font=value, fill=white, anchor="mm")
+        draw.text((x, 321), heading, font=label, fill=muted, anchor="mm")
+        draw.text((x, 351), text, font=value, fill=white, anchor="mm")
 
-    y = 238
+    y = 400
     for date, items in groups:
         draw.text((pad, y + 17), f"{date}  ·  {len(items)} MATCH{'ES' if len(items) != 1 else ''}",
                   font=match_font(18, True), fill=coral, anchor="lm")

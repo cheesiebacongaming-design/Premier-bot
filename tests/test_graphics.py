@@ -5,7 +5,7 @@ from PIL import Image
 from graphics.lineup import render_lineup_card
 from graphics.help_card import render_help_card
 from graphics.match_card import _assign_unique_tags, draw_play_result
-from graphics.player_history import render_player_history
+from graphics.player_history import rank_summary, render_player_history
 from graphics.playbook_card import render_playbook_card, render_strategy_card
 from graphics.rank_change import draw_rank_change_card
 from graphics.schedule import render_schedule_card
@@ -66,7 +66,18 @@ def test_player_history_renders_grouped_rows_with_missing_icons():
     width, height = _png_size(render_player_history("Player", "EU", "competitive", rows, {}))
 
     assert width == 1200
-    assert height == 248 + 2 * (46 + 106) + 20
+    assert height == 410 + 2 * (46 + 106) + 20
+
+
+def test_player_rank_summary_uses_latest_act_and_preserves_zero_rr():
+    mmr = {"current": {"tier": {"id": 16, "name": "Platinum 2"}, "rr": 0},
+           "seasonal": [
+               {"season": {"short": "e9a3"}, "wins": 20, "games": 30},
+               {"season": {"short": "e10a1"}, "wins": 6, "games": 14},
+           ]}
+    assert rank_summary(mmr) == {"rank": "Platinum 2", "tier_id": 16, "rr": 0,
+                                 "act": "E10A1", "wins": 6, "games": 14}
+    assert rank_summary(None)["rank"] == "Unavailable"
 
 
 def test_help_card_grows_to_fit_long_commands_and_descriptions():
