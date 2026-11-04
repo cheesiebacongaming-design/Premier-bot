@@ -1,4 +1,5 @@
 import pytest
+import json
 
 from services.ai_recap import generate_recap, recap_facts
 
@@ -107,3 +108,41 @@ def test_round_highlights_summarise_multikills_without_repeating_all_events():
 
     assert highlights == [{"round": 1, "first_blood": {"seconds": 1.0, "killer": "Player", "victim": "Unknown"},
                            "multikills": [{"player": "Player", "kills": 4}]}]
+
+
+@pytest.mark.asyncio
+async def test_registered_only_recap_omits_other_players_and_events():
+    registered = {"puuid": "p1", "name": "Friend", "team_id": "Red", "stats": {"kills": 12}}
+    unregistered = {"puuid": "p2", "name": "UnlinkedTeammate", "team_id": "Red"}
+    opponent = {"puuid": "p3", "name": "EnemyName", "team_id": "Blue"}
+    detail = {"players": [registered, unregistered, opponent], "metadata": {"map": {"name": "Haven"}},
+              "teams": [], "kills": [
+                  {"round": 0, "time_in_round_in_ms": 1000, "killer": {"puuid": "p1"}, "victim": {"puuid": "p3"}},
+                  {"round": 1, "time_in_round_in_ms": 1000, "killer": {"puuid": "p3"}, "victim": {"puuid": "p1"}},
+                  {"round": 2, "time_in_round_in_ms": 1000, "killer": {"puuid": "p2"}, "victim": {"puuid": "p3"}},
+              ]}
+    response = {"choices": [{"finish_reason": "stop", "message": {
+        "content": '{"headline":"Friend plays Haven", "recap":"Friend fought hard."}'}}]}
+    session = FakeSession(FakeResponse(200, response))
+
+    assert await generate_recap(session, "key", "model", detail, [registered], registered, registered_only=True)
+    messages = session.request[1]["json"]["messages"]
+    assert "Only discuss named players listed in teammates" in messages[0]["content"]
+    raw = messages[1]["content"]
+    assert "UnlinkedTeammate" not in raw and "EnemyName" not in raw
+    facts = json.loads(raw)
+    assert facts["round_highlights"] == [
+        {"round": 1, "first_blood": {"seconds": 1.0, "player": "Friend"}},
+        {"round": 2, "first_death": {"seconds": 1.0, "player": "Friend"}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_registered_only_rejects_ai_output_naming_another_player():
+    registered = {"puuid": "p1", "name": "Friend", "team_id": "Red"}
+    detail = {"players": [registered, {"puuid": "p2", "name": "Stranger", "team_id": "Red"}]}
+    response = {"choices": [{"finish_reason": "stop", "message": {
+        "content": '{"headline":"Friend vs Stranger", "recap":"Friend played."}'}}]}
+    session = FakeSession(FakeResponse(200, response))
+
+    assert await generate_recap(session, "key", "model", detail, [registered], registered, registered_only=True) is None

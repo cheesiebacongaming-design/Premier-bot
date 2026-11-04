@@ -1187,7 +1187,8 @@ async def matchfeed_loop():
                             try:
                                 roster_key = (team_id, tuple(p.get("puuid") for p in registered_players))
                                 if roster_key not in cards_by_roster:
-                                    card = await play_match_image(detail, registered_players, all_team_players, registered_players[0])
+                                    card = await play_match_image(detail, registered_players, all_team_players,
+                                                                  registered_players[0], summary_players=registered_players)
                                     cards_by_roster[roster_key] = card.fp.getvalue()
                                 await channel.send(
                                     content=format_match_notification(
@@ -1248,7 +1249,7 @@ async def matchfeed_loop():
         await asyncio.sleep(max(1, 300 - (loop.time() - cycle_started)))
 
 
-async def play_match_image(detail, queued_players, all_teammates, representative):
+async def play_match_image(detail, queued_players, all_teammates, representative, summary_players=None):
     map_data = (detail.get("metadata", {}).get("map") or {})
     map_uuid = map_data.get("id") or map_data.get("uuid")
     map_name = map_data.get("name", "Unknown")
@@ -1303,9 +1304,11 @@ async def play_match_image(detail, queued_players, all_teammates, representative
     # Keep rendering input local; API response objects remain unchanged.
     render_players = [dict(p, _play_icon=icons_by_puuid.get(p.get("puuid"))) for p in queued_players]
     loop = asyncio.get_running_loop()
+    focus = summary_players if summary_players is not None else all_teammates
     recap = await generate_recap(client.http_session, SETTINGS.groq_api_key, SETTINGS.groq_model,
-                                 detail, all_teammates, representative)
-    buffer = await loop.run_in_executor(None, draw_play_result, detail, render_players, all_teammates, representative, path, recap)
+                                 detail, focus, representative, registered_only=summary_players is not None)
+    buffer = await loop.run_in_executor(None, draw_play_result, detail, render_players, all_teammates,
+                                        representative, path, recap, summary_players)
     return discord.File(buffer, filename="match.png")
 
 

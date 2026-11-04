@@ -1,9 +1,10 @@
 import random
 
 
-def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration, detail=None):
+def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, duration, detail=None, registered_only=False):
     result = "snatched the win" if won else "took the L"
-    recap = f"Your queue {result} on {map_name} after {duration} of competitive Valorant, {our_score}-{their_score}."
+    subject = "Your team" if registered_only else "Your queue"
+    recap = f"{subject} {result} on {map_name} after {duration} of competitive Valorant, {our_score}-{their_score}."
     if not all_teammates:
         return recap
     ranked = sorted(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0), reverse=True)
@@ -13,7 +14,10 @@ def _play_recap(map_name, won, our_score, their_score, tracked, all_teammates, d
     top_acs = round(top_stats.get("score", 0) / max(our_score + their_score, 1))
     top_kd = top_stats.get("kills", 0) / max(top_stats.get("deaths", 0), 1)
     top_title = "sweaty bastard" if top_acs >= 220 or top_kd >= 1.2 else "designated tryhard"
-    recap += (f" {strongest_name} was the {top_title}, topping the team with {top_acs} ACS, "
+    standing = "leading the registered players" if registered_only else "topping the team"
+    if registered_only and len(ranked) == 1:
+        standing = "finishing"
+    recap += (f" {strongest_name} was the {top_title}, {standing} with {top_acs} ACS, "
               f"{top_stats.get('kills', 0)}/{top_stats.get('deaths', 0)}/{top_stats.get('assists', 0)} "
               f"and a {top_kd:.2f} KD.")
     if strongest.get("puuid") != weakest.get("puuid"):
@@ -109,7 +113,7 @@ def _round_highlights(detail, teammates, weakest):
     return highlights
 
 
-def _play_headline(all_teammates, our_score, their_score):
+def _play_headline(all_teammates, our_score, their_score, registered_only=False):
     if not all_teammates:
         return "MATCH RECAP"
     weakest = min(all_teammates, key=lambda p: (p.get("stats") or {}).get("score", 0))
@@ -117,6 +121,8 @@ def _play_headline(all_teammates, our_score, their_score):
     stats = weakest.get("stats") or {}
     acs = round(stats.get("score", 0) / max(our_score + their_score, 1))
     name = weakest.get("name", "PLAYER").upper()
+    if registered_only and len(all_teammates) == 1:
+        return f"{name}'S MATCH RECAP"
     if weakest.get("puuid") == strongest.get("puuid"):
         return f"{name} WAS BOTH THE CARRY AND THE CONTENT"
     if stats.get("deaths", 0) >= 18:
