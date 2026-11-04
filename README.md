@@ -73,6 +73,82 @@ place; no database migration is required. Corrupt state files raise errors
 instead of silently resetting data. Cache writes use atomic replacement.
 `season.json` is local schedule data and should be preserved too.
 
+## Interactive playbooks
+
+`/playbook` opens a private map, side, and strategy browser. Choose another map
+or side in the same menu; use its page buttons for long lists or strategy text.
+Menus expire after ten minutes and can be reopened with `/playbook`.
+
+Administrators can use `/createplaybook` to open a private editor:
+
+1. Choose a map and Attack or Defence. Choose **New strategy**, or select an
+   existing strategy and choose **Edit**.
+2. Use **Details** for the name, objective, and ordered steps (one per line).
+   Use **Assignments** for up to five lines in this format:
+   `role | player | agent | position | responsibilities | utility`.
+3. Use **Utility & links** for utility notes and one HTTP(S) URL per line.
+   **Import lineup** copies the existing agent picks for that map into an empty
+   draft; it never changes the saved `/agent` lineup.
+4. Use **Diagram** to add a public image URL, marker JSON, or both. Review the
+   draft and choose **Save strategy**. Cancel or let the session expire to
+   discard unsaved work. Editing uses the same workflow. Deletion requires a
+   separate confirmation; stale revisions are rejected instead of overwritten.
+
+The optional `map_name`, `notes`, and `links` command arguments can seed the
+editor; they do not save until the draft is confirmed. An image URL is displayed
+by Discord and is not downloaded by the bot. Make sure the URL remains valid;
+temporary attachment URLs can expire.
+
+### Tactical diagrams
+
+For marker-based diagrams the bot looks for a trusted local top-down image at
+`assets/playbook_maps/<map-slug>.png` (for example `assets/playbook_maps/ascent.png`
+or `assets/playbook_maps/sunset.png`). The slug is the lowercase map name with
+non-alphanumeric characters replaced by hyphens. If no local image exists, the
+bot attempts to use the map's top-down `displayIcon` from valorant-api.com and
+caches it in `icons/`. If neither is available, the written strategy remains
+available. Local images are deployment assets: back them up and copy them to
+new hosts. They are not downloaded from arbitrary strategy URLs.
+
+The Diagram form accepts a JSON array. Coordinates are normalized from 0 to 1:
+`[0, 0]` is the top left of the displayed source image and `[1, 1]` is the
+bottom right, including any transparent padding in that image. Available kinds
+are `player`, `smoke`, `utility`, `step`, `site`, and `path`. Paths need at
+least two points; all markers include `x` and `y`. For example:
+
+```json
+[
+  {"kind":"player", "x":0.20, "y":0.70, "label":"1"},
+  {"kind":"smoke", "x":0.65, "y":0.35, "label":"Heaven"},
+  {"kind":"path", "x":0.20, "y":0.70, "points":[[0.20,0.70],[0.65,0.35]]},
+  {"kind":"site", "x":0.78, "y":0.27, "label":"A"}
+]
+```
+
+Marker input is JSON, not a graphical map editor. Clearing both marker JSON and
+the image URL removes the diagram. A rendered marker diagram takes precedence
+over the reference image when a map background is available.
+
+### Storage and migration
+
+The store remains `playbooks.json` in the bot's working directory. The current
+schema is `{"version": 1, "strategies": [...]}`. Each strategy has an ID,
+name, map, side (`attack`, `defence`, or migrated `legacy`), objective, ordered
+`steps`, `assignments`, `utility`, `links`, optional `diagram` (`image_url` and
+`markers`), creation/update timestamps, and a revision number. Assignments
+contain `role`, `player`, `agent`, `starting_position`, `responsibilities`, and
+`utility`. Diagram paths and markers use normalized coordinates.
+
+On first playbook use, valid old map-to-notes entries are migrated into the
+**Legacy** side without guessing Attack or Defence. Original notes, links, and
+other entry fields are retained, and a byte-for-byte
+`playbooks.json.legacy-<id>.bak` is created before the atomic replacement.
+Malformed or unsupported data stops migration and is left untouched. Keep the
+backup along with regular backups of the state file. A lock file coordinates
+playbook operations across bot processes that use this service; stop the bot
+before editing JSON directly. Do not run an older bot version against the
+migrated file: restore a backup first if rolling back.
+
 Downloaded icons live in `icons/`. Optional fonts in `assets/fonts/` are
 `Roboto-Regular.ttf`, `Roboto-Bold.ttf`, `Lora-Regular.ttf`, and `Lora-Bold.ttf`.
 System fonts are used when these are missing; copy your existing fonts to keep

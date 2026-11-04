@@ -16,6 +16,8 @@ agents.json
 cache.json
 .*.json.*.tmp
 playbooks.json
+playbooks.json.legacy-*.bak
+playbooks.json.lock
 queue_schedule.json
 schedule.json
 play_sessions.json

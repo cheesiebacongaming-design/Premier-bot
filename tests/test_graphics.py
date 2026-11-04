@@ -6,6 +6,7 @@ from graphics.lineup import render_lineup_card
 from graphics.help_card import render_help_card
 from graphics.match_card import _assign_unique_tags, draw_play_result
 from graphics.player_history import render_player_history
+from graphics.playbook_card import render_playbook_card
 from graphics.rank_change import draw_rank_change_card
 from graphics.schedule import render_schedule_card
 
@@ -77,6 +78,15 @@ def test_help_card_grows_to_fit_long_commands_and_descriptions():
 
     assert short_width == long_width == 1200
     assert long_height > short_height
+
+
+def test_tactical_map_renders_markers_and_missing_map_is_optional(tmp_path):
+    assert render_playbook_card("Ascent", "attack", "Execute", tmp_path / "missing.png", []) is None
+    background = Image.new("RGBA", (600, 400), (70, 70, 75, 255))
+    markers = [{"kind": "player", "x": 0.2, "y": 0.5, "label": "1"},
+               {"kind": "smoke", "x": 0.7, "y": 0.5, "label": ""},
+               {"kind": "path", "x": 0.2, "y": 0.5, "points": [[0.2, 0.5], [0.7, 0.5]]}]
+    assert _png_size(render_playbook_card("Ascent", "attack", "Execute", background, markers)) == (1024, 1080)
 
 
 def test_rank_change_renderer_returns_fixed_size_png_without_icons():
