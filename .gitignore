@@ -18,6 +18,7 @@ cache.json
 playbooks.json
 playbooks.json.legacy-*.bak
 playbooks.json.lock
+playbook_images/
 queue_schedule.json
 schedule.json
 play_sessions.json

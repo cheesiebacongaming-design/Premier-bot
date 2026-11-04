@@ -35,6 +35,7 @@ files. Configure automatic reports with `/matchfeed` in the target server.
 | `TEAM_NAME`, `TEAM_TAG` | Team lookup when no ID is configured |
 | `ROSTER` | Optional comma-separated `Name#Tag` entries for history fallback |
 | `AFFINITY` | VALORANT region; defaults to `eu` |
+| `COMPETITIVE_MAPS` | Optional comma-separated map rotation for playbook menus |
 | `GUILD_ID` | Optional server ID for guild command synchronization |
 | `X_BEARER_TOKEN`, `X_USERNAME` | Optional X schedule lookup credentials/account |
 | `X_KEYWORD` | Schedule search keyword; defaults to `premier` |
@@ -60,6 +61,10 @@ the absolute path of `.venv/bin/python` followed by the absolute path to
 `bot.py`. Run only one bot process per state directory to avoid duplicate
 polling and conflicting JSON writes.
 
+Native playbook uploads require `discord.py` 2.7 or newer. After pulling this
+update, run `.venv/bin/python -m pip install -r requirements.txt` before
+restarting the service.
+
 Before updating, stop the bot and back up `.env`, all local JSON files, and
 custom assets outside the checkout. Pull the intended deployment branch,
 install `requirements.txt` again, then restart the service. Refactor branches
@@ -83,21 +88,24 @@ Administrators can use `/createplaybook` to open a private editor:
 
 1. Choose a map and Attack or Defence. Choose **New strategy**, or select an
    existing strategy and choose **Edit**.
-2. Use **Details** for the name, objective, and ordered steps (one per line).
-   Use **Assignments** for up to five lines in this format:
-   `role | player | agent | position | responsibilities | utility`.
-3. Use **Utility & links** for utility notes and one HTTP(S) URL per line.
-   **Import lineup** copies the existing agent picks for that map into an empty
-   draft; it never changes the saved `/agent` lineup.
-4. Use **Diagram** to add a public image URL, marker JSON, or both. Review the
-   draft and choose **Save strategy**. Cancel or let the session expire to
+2. Use **Title & description** for the title and short description, then use
+   **Upload image** to attach a PNG, JPEG or WebP from Discord. Images are optional.
+3. Review the draft and choose **Save strategy**. Cancel or let the session expire to
    discard unsaved work. Editing uses the same workflow. Deletion requires a
    separate confirmation; stale revisions are rejected instead of overwritten.
 
-The optional `map_name`, `notes`, and `links` command arguments can seed the
-editor; they do not save until the draft is confirmed. An image URL is displayed
-by Discord and is not downloaded by the bot. Make sure the URL remains valid;
-temporary attachment URLs can expire.
+The optional `map_name` command argument opens a particular map in the editor.
+Native uploads are stored in the local
+`playbook_images/` directory and persist independently of Discord URLs. Uploads
+are limited to 8 MiB and 8 megapixels. Replacing or removing an image does not
+delete old image files, since another strategy or backup may still use them.
+Back up `playbook_images/` along with `playbooks.json`.
+
+Playbook menus show the configured competitive map rotation. The default is the
+patch 13.08 pool: Abyss, Bind, Corrode, Haven, Lotus, Summit and Sunset. Update
+the comma-separated `COMPETITIVE_MAPS` setting when Riot changes the rotation;
+this list is not automatically updated. A rotated-out map with saved strategies
+can still be opened by entering its exact name in `/playbook` or `/createplaybook`.
 
 ### Tactical diagrams
 
@@ -110,7 +118,7 @@ caches it in `icons/`. If neither is available, the written strategy remains
 available. Local images are deployment assets: back them up and copy them to
 new hosts. They are not downloaded from arbitrary strategy URLs.
 
-The Diagram form accepts a JSON array. Coordinates are normalized from 0 to 1:
+Existing marker-based diagrams remain viewable. Their coordinates are normalized from 0 to 1:
 `[0, 0]` is the top left of the displayed source image and `[1, 1]` is the
 bottom right, including any transparent padding in that image. Available kinds
 are `player`, `smoke`, `utility`, `step`, `site`, and `path`. Paths need at
@@ -125,16 +133,17 @@ least two points; all markers include `x` and `y`. For example:
 ]
 ```
 
-Marker input is JSON, not a graphical map editor. Clearing both marker JSON and
-the image URL removes the diagram. A rendered marker diagram takes precedence
-over the reference image when a map background is available.
+The simplified editor does not edit marker JSON. **Remove image** clears an upload
+or image URL from the draft; existing markers remain. An uploaded image takes precedence,
+then a rendered marker diagram, then an image URL. Steps, assignments, utility
+and links from previously saved strategies are preserved when their title or description changes.
 
 ### Storage and migration
 
 The store remains `playbooks.json` in the bot's working directory. The current
 schema is `{"version": 1, "strategies": [...]}`. Each strategy has an ID,
 name, map, side (`attack`, `defence`, or migrated `legacy`), objective, ordered
-`steps`, `assignments`, `utility`, `links`, optional `diagram` (`image_url` and
+`steps`, `assignments`, `utility`, `links`, optional `diagram` (`image_url`, `image_asset` and
 `markers`), creation/update timestamps, and a revision number. Assignments
 contain `role`, `player`, `agent`, `starting_position`, `responsibilities`, and
 `utility`. Diagram paths and markers use normalized coordinates.

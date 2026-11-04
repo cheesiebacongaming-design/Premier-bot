@@ -2057,21 +2057,36 @@ playbook_service = PlaybookService(PLAYBOOK_FILE)
 
 
 async def available_playbook_maps():
-    maps = list(season_maps())
-    try:
-        maps.extend(item.get("displayName") for item in await valorant_map_catalog() if item.get("displayName"))
-    except Exception as exc:
-        print(f"Playbook map catalog unavailable: {exc}")
-    maps.extend(s["map"] for s in playbook_service.list())
     unique = {}
-    for name in maps:
-        if name and name.casefold() != "the range":
+    for name in SETTINGS.competitive_maps:
+        if name:
             unique.setdefault(name.casefold(), name)
     return sorted(unique.values(), key=str.casefold)
 
 
+def find_playbook_map(maps, map_name):
+    if not map_name:
+        return None
+    key = map_name.strip().casefold()
+    picked = next((name for name in maps if name.casefold() == key), None)
+    if picked:
+        return picked
+    # Keep already-saved strategies on rotated-out maps accessible by name.
+    return next((s["map"] for s in playbook_service.list() if s["map"].casefold() == key), None)
+
+
 async def playbook_diagram_file(strategy):
     """Render markers on a local top-down map, or the public map catalog icon."""
+    image_asset = (strategy.get("diagram") or {}).get("image_asset")
+    if image_asset:
+        try:
+            image_path = playbook_service.image_path(image_asset)
+            if image_path.is_file():
+                return discord.File(image_path, filename="playbook-map." + image_path.suffix.lstrip("."))
+        except (OSError, PlaybookDataError):
+            pass
+    if not ((strategy.get("diagram") or {}).get("markers") or []):
+        return None
     map_name = strategy.get("map", "")
     slug = re.sub(r"[^a-z0-9]+", "-", map_name.casefold()).strip("-")
     local_path = Path(__file__).resolve().parent / "assets" / "playbook_maps" / f"{slug}.png"
@@ -2092,28 +2107,13 @@ async def playbook_diagram_file(strategy):
     return discord.File(buffer, filename="playbook-map.png") if buffer else None
 
 
-async def playbook_lineup(map_name, guild):
-    agents = load_agents()
-    picks = agents.get(matching_map_key(agents, map_name), {})
-    if len(picks) > 5:
-        raise PlaybookDataError("The lineup has more than five players; edit it before importing.")
-    assignments = []
-    for user_id, agent in sorted(picks.items()):
-        try:
-            name = await discord_display_name(guild, int(user_id))
-        except (TypeError, ValueError):
-            raise JsonStoreError("An existing lineup has an invalid user ID")
-        assignments.append({"player": name, "agent": str(agent)})
-    return assignments
-
-
 @tree.command(name="playbook", description="Browse strategies by map and side")
 @app_commands.describe(map_name="Optional map to open first")
 async def playbook(interaction: discord.Interaction, map_name: str = ""):
     await interaction.response.defer(ephemeral=True)
     try:
         maps = await available_playbook_maps()
-        picked = next((name for name in maps if name.casefold() == map_name.strip().casefold()), None) if map_name else None
+        picked = find_playbook_map(maps, map_name)
         if map_name and not picked:
             return await interaction.followup.send("Map not found. Choose a map from the menu.", ephemeral=True)
         view = PlaybookView(playbook_service, maps, interaction.user.id, picked, playbook_diagram_file)
@@ -2125,17 +2125,17 @@ async def playbook(interaction: discord.Interaction, map_name: str = ""):
 
 @tree.command(name="createplaybook", description="Create, edit or delete playbook strategies (administrators only)")
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(map_name="Optional map", notes="Optional initial objective", links="Optional initial URLs")
-async def createplaybook(interaction: discord.Interaction, map_name: str = "", notes: str = "", links: str = ""):
+@app_commands.describe(map_name="Optional map")
+async def createplaybook(interaction: discord.Interaction, map_name: str = ""):
     if not interaction.guild or not interaction.permissions.administrator:
         return await interaction.response.send_message("Only server administrators can use this command.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     try:
         maps = await available_playbook_maps()
-        picked = next((name for name in maps if name.casefold() == map_name.strip().casefold()), None) if map_name else None
+        picked = find_playbook_map(maps, map_name)
         if map_name and not picked:
             return await interaction.followup.send("Map not found. Choose a map from the menu.", ephemeral=True)
-        view = PlaybookAdminView(playbook_service, maps, interaction.user.id, picked, notes, links, playbook_lineup)
+        view = PlaybookAdminView(playbook_service, maps, interaction.user.id, picked)
         view.message = await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True,
                                                        allowed_mentions=discord.AllowedMentions.none(), wait=True)
     except JsonStoreError as exc:
@@ -2148,7 +2148,7 @@ async def playbook_map_autocomplete(interaction: discord.Interaction, current: s
     try:
         maps = await available_playbook_maps()
     except JsonStoreError:
-        maps = season_maps()
+        maps = list(SETTINGS.competitive_maps)
     return [app_commands.Choice(name=m[:100], value=m[:100]) for m in maps if current.casefold() in m.casefold()][:25]
 
 

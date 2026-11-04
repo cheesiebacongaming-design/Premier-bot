@@ -20,7 +20,7 @@ def _chunks(text, limit=3400):
 
 
 def strategy_pages(strategy):
-    lines = [f"**Objective**\n{_safe(strategy.get('objective')) or 'No objective provided.'}"]
+    lines = [f"**Description**\n{_safe(strategy.get('objective')) or 'No description provided.'}"]
     if strategy.get("steps"):
         lines.append("**Execution**\n" + "\n".join(f"{i}. {_safe(step)}" for i, step in enumerate(strategy["steps"], 1)))
     if strategy.get("assignments"):
@@ -34,7 +34,7 @@ def strategy_pages(strategy):
     if strategy.get("links"):
         lines.append("**Reference links**\n" + "\n".join(_safe(link) for link in strategy["links"]))
     diagram = strategy.get("diagram") or {}
-    if diagram.get("markers") or diagram.get("image_url"):
+    if diagram.get("markers") or diagram.get("image_url") or diagram.get("image_asset"):
         lines.append("**Tactical diagram**\nAvailable with this strategy.")
     return _chunks("\n\n".join(lines))
 
@@ -201,8 +201,8 @@ class PlaybookView(discord.ui.View):
             self.refresh()
             embed = self.embed()
             strategy = self.service.get(self.strategy_id) if self.strategy_id else None
-            markers = ((strategy or {}).get("diagram") or {}).get("markers") or []
-            if strategy and markers and self.diagram_renderer:
+            diagram = (strategy or {}).get("diagram") or {}
+            if strategy and (diagram.get("markers") or diagram.get("image_asset")) and self.diagram_renderer:
                 await interaction.response.defer()
                 try:
                     image = await self.diagram_renderer(strategy)
@@ -210,7 +210,7 @@ class PlaybookView(discord.ui.View):
                     image = None
                 attachments = [image] if image else []
                 if image:
-                    embed.set_image(url="attachment://playbook-map.png")
+                    embed.set_image(url=f"attachment://{image.filename}")
                 await interaction.edit_original_response(embed=embed, view=self, attachments=attachments,
                                                          allowed_mentions=discord.AllowedMentions.none())
             else:

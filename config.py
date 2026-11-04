@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 
 REGIONS = ("eu", "na", "ap", "kr", "latam", "br")
+DEFAULT_COMPETITIVE_MAPS = ("Abyss", "Bind", "Corrode", "Haven", "Lotus", "Summit", "Sunset")
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class Settings:
     font_dir: Path
     groq_api_key: Optional[str]
     groq_model: str
+    competitive_maps: Tuple[str, ...]
 
 
 def load_settings(environ=None) -> Settings:
@@ -89,6 +91,8 @@ def load_settings(environ=None) -> Settings:
         font_dir=Path(__file__).resolve().parent / "assets" / "fonts",
         groq_api_key=(environ.get("GROQ_API_KEY") or "").strip() or None,
         groq_model=(environ.get("GROQ_MODEL") or "qwen/qwen3.8-27b").strip(),
+        competitive_maps=tuple(name.strip() for name in (environ.get("COMPETITIVE_MAPS") or "").split(",")
+                               if name.strip()) or DEFAULT_COMPETITIVE_MAPS,
     )
 
 

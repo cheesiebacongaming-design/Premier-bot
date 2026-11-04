@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from models.playbook import SIDES, Strategy
 from services.json_store import write_json
+from services.playbook_images import asset_path, save_image
 from services.playbook_store import PlaybookDataError, load_playbook_store, validate_store
 
 
@@ -119,7 +120,13 @@ def validate_draft(draft, allow_legacy=False):
                                   "y": _coordinate(marker.get("y")), "label": _text(marker.get("label", ""), "Marker label", 40),
                                   "points": clean_points})
         image_url = diagram.get("image_url", "")
-        diagram = {"markers": clean_markers, "image_url": _url(image_url) if image_url else ""}
+        image_asset = diagram.get("image_asset", "")
+        if not isinstance(image_asset, str):
+            raise PlaybookDataError("Invalid playbook image reference")
+        if image_asset:
+            asset_path("playbooks.json", image_asset)
+        diagram = {"markers": clean_markers, "image_url": _url(image_url) if image_url else "",
+                   "image_asset": image_asset}
     return {"name": _text(draft.get("name", ""), "Name", 80, True),
             "map": _text(draft.get("map", ""), "Map", 100, True), "side": side,
             "objective": _text(draft.get("objective", ""), "Objective", 4000),
@@ -154,26 +161,64 @@ class PlaybookService:
                for s in data["strategies"]):
             raise PlaybookDataError("A strategy with that name already exists for this map and side")
 
-    def create(self, draft):
+    def image_path(self, asset_name):
+        return asset_path(self.path, asset_name)
+
+    def create(self, draft, image_bytes=None):
         clean = validate_draft(draft)
         with self._store() as data:
             self._check_duplicate(data, clean)
+            if image_bytes is not None:
+                if clean["diagram"] is None:
+                    clean["diagram"] = {"markers": [], "image_url": "", "image_asset": ""}
+                clean["diagram"]["image_asset"] = save_image(self.path, image_bytes)
             now = datetime.now(timezone.utc).isoformat()
             strategy = Strategy(id=uuid.uuid4().hex, created_at=now, updated_at=now, **clean).to_dict()
             data["strategies"].append(strategy)
             write_json(self.path, validate_store(data))
             return copy.deepcopy(strategy)
 
-    def update(self, strategy_id, expected_revision, draft):
+    def update(self, strategy_id, expected_revision, draft, image_bytes=None):
         with self._store() as data:
             current = next((s for s in data["strategies"] if s["id"] == strategy_id), None)
             if current is None or current["revision"] != expected_revision:
                 raise PlaybookConflict("Strategy changed or was deleted; reopen it before saving")
             clean = validate_draft(draft, allow_legacy=current["side"] == "legacy")
             self._check_duplicate(data, clean, exclude=strategy_id)
+            if image_bytes is not None:
+                if clean["diagram"] is None:
+                    clean["diagram"] = {"markers": [], "image_url": "", "image_asset": ""}
+                clean["diagram"]["image_asset"] = save_image(self.path, image_bytes)
             current.update(clean)
             current["revision"] += 1
             current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            write_json(self.path, validate_store(data))
+            return copy.deepcopy(current)
+
+    def update_details(self, strategy_id, expected_revision, name, description, image_bytes=None, remove_image=False):
+        """Update the visible fields without rewriting legacy strategy data."""
+        with self._store() as data:
+            current = next((s for s in data["strategies"] if s["id"] == strategy_id), None)
+            if current is None or current["revision"] != expected_revision:
+                raise PlaybookConflict("Strategy changed or was deleted; reopen it before saving")
+            name = _text(name, "Title", 80, True)
+            if description == current.get("objective"):
+                if not isinstance(description, str) or not description.strip():
+                    raise PlaybookDataError("Enter a short description")
+            else:
+                description = _text(description, "Short description", 500, True)
+            self._check_duplicate(data, {"name": name, "map": current["map"], "side": current["side"]}, exclude=strategy_id)
+            diagram = copy.deepcopy(current.get("diagram"))
+            if remove_image and diagram:
+                diagram.pop("image_asset", None)
+                diagram.pop("image_url", None)
+                if not any(diagram.values()):
+                    diagram = None
+            if image_bytes is not None:
+                diagram = diagram or {"markers": []}
+                diagram["image_asset"] = save_image(self.path, image_bytes)
+            current.update(name=name, objective=description, diagram=diagram,
+                           revision=current["revision"] + 1, updated_at=datetime.now(timezone.utc).isoformat())
             write_json(self.path, validate_store(data))
             return copy.deepcopy(current)
 
