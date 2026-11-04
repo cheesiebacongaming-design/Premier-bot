@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from io import BytesIO
+import asyncio
 
 import discord
 import pytest
@@ -31,11 +32,11 @@ async def test_browse_map_side_and_strategy_without_mutating(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_browse_rejects_other_users(tmp_path):
+async def test_browse_allows_other_users(tmp_path):
     view = PlaybookView(PlaybookService(tmp_path / "playbooks.json"), ["Ascent"], 123)
     interaction = SimpleNamespace(user=SimpleNamespace(id=456), response=SimpleNamespace(send_message=AsyncMock()))
-    assert not await view.interaction_check(interaction)
-    interaction.response.send_message.assert_awaited_once()
+    assert await view.interaction_check(interaction)
+    interaction.response.send_message.assert_not_awaited()
 
 
 def test_long_strategy_is_paginated_and_mentions_are_escaped():
@@ -86,7 +87,7 @@ async def test_browse_adds_diagram_without_changing_stored_strategy(tmp_path):
     service = PlaybookService(tmp_path / "playbooks.json")
     strategy = service.create({"name": "Execute", "map": "Ascent", "side": "attack", "diagram": {
         "markers": [{"kind": "player", "x": 0.2, "y": 0.4, "label": "1"}]}})
-    render = AsyncMock(return_value=discord.File(BytesIO(b"png"), filename="playbook-map.png"))
+    render = AsyncMock(return_value=(discord.File(BytesIO(b"png"), filename="playbook.png"), True))
     view = PlaybookView(service, ["Ascent"], 123, "Ascent", render)
     view.side, view.strategy_id = "attack", strategy["id"]
     interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock())
@@ -97,8 +98,66 @@ async def test_browse_adds_diagram_without_changing_stored_strategy(tmp_path):
     interaction.response.defer.assert_awaited_once()
     sent = interaction.edit_original_response.await_args.kwargs
     assert len(sent["attachments"]) == 1
-    assert sent["embed"].image.url == "attachment://playbook-map.png"
+    assert sent["embeds"][0].image.url == "attachment://playbook.png"
     assert service.get(strategy["id"])["revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_strategy_without_uploaded_image_still_renders_card(tmp_path):
+    service = PlaybookService(tmp_path / "playbooks.json")
+    strategy = service.create({"name": "Execute", "map": "Haven", "side": "attack", "objective": "Take A"})
+    render = AsyncMock(return_value=(discord.File(BytesIO(b"png"), filename="playbook.png"), False))
+    view = PlaybookView(service, ["Haven"], 123, "Haven", render)
+    view.side, view.strategy_id = "attack", strategy["id"]
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock())
+
+    await view.update_message(interaction)
+
+    assert "Take A" in render.await_args.args[1]
+    assert interaction.edit_original_response.await_args.kwargs["embeds"][0].image.url == "attachment://playbook.png"
+
+
+@pytest.mark.asyncio
+async def test_legacy_image_url_stays_visible_below_generated_card(tmp_path):
+    service = PlaybookService(tmp_path / "playbooks.json")
+    strategy = service.create({"name": "Execute", "map": "Haven", "side": "attack", "objective": "Take A",
+                               "diagram": {"image_url": "https://example.com/map.png", "markers": []}})
+    render = AsyncMock(return_value=(discord.File(BytesIO(b"png"), filename="playbook.png"), False))
+    view = PlaybookView(service, ["Haven"], 123, "Haven", render)
+    view.side, view.strategy_id = "attack", strategy["id"]
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock())
+
+    await view.update_message(interaction)
+
+    embeds = interaction.edit_original_response.await_args.kwargs["embeds"]
+    assert len(embeds) == 2
+    assert embeds[1].image.url == "https://example.com/map.png"
+
+
+@pytest.mark.asyncio
+async def test_slow_shared_render_does_not_overwrite_newer_navigation(tmp_path):
+    service = PlaybookService(tmp_path / "playbooks.json")
+    strategy = service.create({"name": "Execute", "map": "Haven", "side": "attack", "objective": "Take A"})
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def slow_render(*args):
+        started.set()
+        await finish.wait()
+        return discord.File(BytesIO(b"png"), filename="playbook.png"), False
+
+    view = PlaybookView(service, ["Haven", "Bind"], 123, "Haven", slow_render)
+    view.side, view.strategy_id = "attack", strategy["id"]
+    first = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock())
+    task = asyncio.create_task(view.update_message(first))
+    await started.wait()
+    view.map_name, view.side, view.strategy_id = "Bind", None, None
+    newer = SimpleNamespace(response=SimpleNamespace(edit_message=AsyncMock()))
+    await view.update_message(newer)
+    finish.set()
+    await task
+
+    newer.response.edit_message.assert_awaited_once()
+    first.edit_original_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,7 @@ from graphics.help_card import render_help_card
 from graphics.lineup import render_lineup_card
 from graphics.match_card import draw_play_result
 from graphics.player_history import render_player_history
-from graphics.playbook_card import render_playbook_card
+from graphics.playbook_card import render_playbook_card, render_strategy_card
 from graphics.rank_change import draw_rank_change_card
 from graphics.schedule import render_schedule_card
 from graphics.scoreboard import draw_scoreboard
@@ -2107,17 +2107,31 @@ async def playbook_diagram_file(strategy):
     return discord.File(buffer, filename="playbook-map.png") if buffer else None
 
 
+async def playbook_strategy_file(strategy, page_text):
+    """Compose strategy text with a local uploaded image or rendered tactical map."""
+    diagram_file = await playbook_diagram_file(strategy)
+    image_bytes = None
+    if diagram_file:
+        try:
+            image_bytes = await asyncio.to_thread(diagram_file.fp.read)
+        finally:
+            diagram_file.close()
+    loop = asyncio.get_running_loop()
+    buffer = await loop.run_in_executor(None, render_strategy_card, strategy, page_text, image_bytes)
+    return discord.File(buffer, filename="playbook.png"), bool(image_bytes)
+
+
 @tree.command(name="playbook", description="Browse strategies by map and side")
 @app_commands.describe(map_name="Optional map to open first")
 async def playbook(interaction: discord.Interaction, map_name: str = ""):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         maps = await available_playbook_maps()
         picked = find_playbook_map(maps, map_name)
         if map_name and not picked:
             return await interaction.followup.send("Map not found. Choose a map from the menu.", ephemeral=True)
-        view = PlaybookView(playbook_service, maps, interaction.user.id, picked, playbook_diagram_file)
-        view.message = await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True,
+        view = PlaybookView(playbook_service, maps, interaction.user.id, picked, playbook_strategy_file)
+        view.message = await interaction.followup.send(embed=view.embed(), view=view,
                                                        allowed_mentions=discord.AllowedMentions.none(), wait=True)
     except JsonStoreError as exc:
         await interaction.followup.send(f"Playbook unavailable: {exc}", ephemeral=True)

@@ -80,8 +80,11 @@ instead of silently resetting data. Cache writes use atomic replacement.
 
 ## Interactive playbooks
 
-`/playbook` opens a private map, side, and strategy browser. Choose another map
+`/playbook` posts a public map, side, and strategy browser that anyone can use. Choose another map
 or side in the same menu; use its page buttons for long lists or strategy text.
+Selected strategies render as a card with the title, description and uploaded
+image. Older strategies with external image URLs display the image beneath the
+generated card without the bot downloading that URL.
 Menus expire after ten minutes and can be reopened with `/playbook`.
 
 Administrators can use `/createplaybook` to open a private editor:

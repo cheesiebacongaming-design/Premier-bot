@@ -55,12 +55,10 @@ class PlaybookView(discord.ui.View):
         self.map_page = 0
         self.message = None
         self.diagram_renderer = diagram_renderer
+        self._generation = 0
         self.refresh()
 
     async def interaction_check(self, interaction):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Run /playbook to open your own menu.", ephemeral=True)
-            return False
         return True
 
     async def on_timeout(self):
@@ -198,20 +196,43 @@ class PlaybookView(discord.ui.View):
 
     async def update_message(self, interaction):
         try:
+            self._generation += 1
+            generation = self._generation
             self.refresh()
             embed = self.embed()
             strategy = self.service.get(self.strategy_id) if self.strategy_id else None
-            diagram = (strategy or {}).get("diagram") or {}
-            if strategy and (diagram.get("markers") or diagram.get("image_asset")) and self.diagram_renderer:
+            if strategy and self.diagram_renderer:
+                pages = strategy_pages(strategy)
+                page_text = pages[min(self.page, len(pages) - 1)]
                 await interaction.response.defer()
                 try:
-                    image = await self.diagram_renderer(strategy)
+                    image, included_diagram = await self.diagram_renderer(strategy, page_text)
                 except Exception:
                     image = None
+                    included_diagram = False
+                if generation != self._generation:
+                    if image:
+                        image.close()
+                    return
                 attachments = [image] if image else []
                 if image:
-                    embed.set_image(url=f"attachment://{image.filename}")
-                await interaction.edit_original_response(embed=embed, view=self, attachments=attachments,
+                    card_embed = discord.Embed(colour=0xF0636A)
+                    # Keep existing detailed text and clickable links accessible for legacy strategies.
+                    if any(strategy.get(key) for key in ("steps", "assignments", "utility", "links")):
+                        card_embed.description = page_text
+                    card_embed.set_image(url=f"attachment://{image.filename}")
+                    embeds = [card_embed]
+                    diagram = strategy.get("diagram") or {}
+                    if not included_diagram and diagram.get("image_url"):
+                        try:
+                            reference = discord.Embed(colour=0xF0636A)
+                            reference.set_image(url=_url(diagram["image_url"]))
+                            embeds.append(reference)
+                        except PlaybookDataError:
+                            pass
+                else:
+                    embeds = [embed]
+                await interaction.edit_original_response(embeds=embeds, view=self, attachments=attachments,
                                                          allowed_mentions=discord.AllowedMentions.none())
             else:
                 await interaction.response.edit_message(embed=embed, view=self, attachments=[],
