@@ -6,7 +6,7 @@ import discord
 import pytest
 
 from commands.playbook_views import PlaybookView, strategy_pages
-from commands.playbook_admin import PlaybookAdminView, DraftModal
+from commands.playbook_admin import PlaybookAdminView, DraftModal, ImageUploadModal
 from services.playbook_service import PlaybookService
 
 
@@ -57,14 +57,13 @@ async def test_admin_create_draft_save_and_confirm_delete(tmp_path):
     new = next(item for item in view.children if getattr(item, "label", "") == "New strategy")
     await new.callback(interaction)
     assert service.list() == []
-    modal = DraftModal(view, "basic")
+    modal = DraftModal(view)
     modal.inputs["name"]._value = "A Execute"
     modal.inputs["objective"]._value = "Take A"
-    modal.inputs["steps"]._value = "Smoke\nEnter"
     await modal.on_submit(interaction)
     save = next(item for item in view.children if getattr(item, "label", "") == "Save strategy")
     await save.callback(interaction)
-    assert service.list()[0]["steps"] == ["Smoke", "Enter"]
+    assert service.list()[0]["objective"] == "Take A"
     delete = next(item for item in view.children if getattr(item, "label", "") == "Delete")
     await delete.callback(interaction)
     assert len(service.list()) == 1
@@ -123,23 +122,16 @@ async def test_admin_stale_draft_does_not_overwrite_another_edit(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_lineup_import_requires_empty_draft_and_does_not_save(tmp_path):
+async def test_editor_only_offers_title_description_and_image(tmp_path):
     service = PlaybookService(tmp_path / "playbooks.json")
-    loader = AsyncMock(return_value=[{"player": "Player", "agent": "Jett"}])
-    view = PlaybookAdminView(service, ["Ascent"], 123, "Ascent", lineup_loader=loader)
-    view.side = "attack"
+    view = PlaybookAdminView(service, ["Ascent"], 123, "Ascent")
+    view.side, view.draft = "attack", {"name": "", "map": "Ascent", "side": "attack", "objective": ""}
     view.refresh()
-    interaction = SimpleNamespace(user=SimpleNamespace(id=123), guild=object(),
-        permissions=SimpleNamespace(administrator=True),
-        response=SimpleNamespace(edit_message=AsyncMock(), defer=AsyncMock(), send_message=AsyncMock()),
-        edit_original_response=AsyncMock(), followup=SimpleNamespace(send=AsyncMock()))
-    await next(item for item in view.children if getattr(item, "label", "") == "New strategy").callback(interaction)
-    await next(item for item in view.children if getattr(item, "label", "") == "Import lineup").callback(interaction)
-    assert view.draft["assignments"] == [{"player": "Player", "agent": "Jett"}]
-    assert service.list() == []
-    await next(item for item in view.children if getattr(item, "label", "") == "Import lineup").callback(interaction)
-    assert loader.await_count == 1
-    interaction.response.send_message.assert_awaited_once()
+    modal = DraftModal(view)
+    assert set(modal.inputs) == {"name", "objective"}
+    labels = {getattr(item, "label", "") for item in view.children}
+    assert {"Title & description", "Upload image"} <= labels
+    assert not {"Assignments", "Utility & links", "Diagram", "Import lineup"} & labels
 
 
 @pytest.mark.asyncio
@@ -155,3 +147,79 @@ async def test_browser_pages_through_more_than_discord_select_limit(tmp_path):
     await next(item for item in view.children if getattr(item, "label", "") == "Next strategies").callback(interaction)
     selector = next(item for item in view.children if getattr(item, "placeholder", "") == "Choose a strategy")
     assert len(selector.options) == 2
+
+
+@pytest.mark.asyncio
+async def test_admin_upload_is_a_draft_until_saved(tmp_path):
+    from PIL import Image
+
+    service = PlaybookService(tmp_path / "playbooks.json")
+    view = PlaybookAdminView(service, ["Haven"], 123, "Haven")
+    view.side = "attack"
+    view.draft = {"name": "Execute", "map": "Haven", "side": "attack", "objective": "Take the site", "diagram": None}
+    view.refresh()
+    payload = BytesIO()
+    Image.new("RGB", (10, 10), "red").save(payload, "PNG")
+    attachment = SimpleNamespace(size=len(payload.getvalue()), read=AsyncMock(return_value=payload.getvalue()))
+    modal = ImageUploadModal(view)
+    modal.upload._values = [attachment]
+    interaction = SimpleNamespace(user=SimpleNamespace(id=123), guild=object(),
+        permissions=SimpleNamespace(administrator=True),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock(), edit_message=AsyncMock()),
+        edit_original_response=AsyncMock(), followup=SimpleNamespace(send=AsyncMock()))
+
+    await modal.on_submit(interaction)
+
+    assert view.pending_image == payload.getvalue()
+    assert service.list() == []
+    assert not (tmp_path / "playbook_images").exists()
+    save = next(item for item in view.children if getattr(item, "label", "") == "Save strategy")
+    await save.callback(interaction)
+    stored = service.list()[0]
+    assert service.image_path(stored["diagram"]["image_asset"]).read_bytes() == payload.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_non_administrator_before_reading_file(tmp_path):
+    view = PlaybookAdminView(PlaybookService(tmp_path / "playbooks.json"), ["Haven"], 123, "Haven")
+    view.draft = {"name": "Execute", "map": "Haven", "side": "attack"}
+    modal = ImageUploadModal(view)
+    attachment = SimpleNamespace(size=5, read=AsyncMock(return_value=b"image"))
+    modal.upload._values = [attachment]
+    interaction = SimpleNamespace(user=SimpleNamespace(id=123), guild=object(),
+        permissions=SimpleNamespace(administrator=False), response=SimpleNamespace(send_message=AsyncMock()))
+
+    await modal.on_submit(interaction)
+
+    attachment.read.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_editing_details_preserves_saved_upload_and_other_fields(tmp_path):
+    from PIL import Image
+
+    service = PlaybookService(tmp_path / "playbooks.json")
+    payload = BytesIO()
+    Image.new("RGB", (10, 10), "red").save(payload, "PNG")
+    stored = service.create({"name": "Execute", "map": "Haven", "side": "attack", "objective": "Initial",
+                             "steps": ["Smoke"], "assignments": [{"role": "Entry"}],
+                             "links": ["https://example.com"], "diagram": {"markers": [
+                                 {"kind": "smoke", "x": 0.5, "y": 0.5}]}}, payload.getvalue())
+    view = PlaybookAdminView(service, ["Haven"], 123, "Haven")
+    view.side, view.original, view.draft = "attack", stored, dict(stored)
+    modal = DraftModal(view)
+    modal.inputs["name"]._value = "Updated"
+    modal.inputs["objective"]._value = "New description"
+    interaction = SimpleNamespace(user=SimpleNamespace(id=123), guild=object(),
+        permissions=SimpleNamespace(administrator=True), response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()))
+
+    await modal.on_submit(interaction)
+
+    save = next(item for item in view.children if getattr(item, "label", "") == "Save strategy")
+    await save.callback(interaction)
+    result = service.get(stored["id"])
+    assert result["diagram"] == stored["diagram"]
+    assert result["steps"] == stored["steps"]
+    assert result["assignments"] == stored["assignments"]
+    assert result["links"] == stored["links"]

@@ -1,13 +1,15 @@
 """Private administrator workflows for creating and editing strategies."""
 
 import copy
-import json
+import asyncio
+import io
 import math
 
 import discord
 
 from commands.playbook_views import _safe, strategy_pages
-from services.playbook_service import PlaybookDataError, validate_draft
+from services.playbook_service import PlaybookDataError
+from services.playbook_images import MAX_IMAGE_BYTES, validate_image
 
 
 def _can_manage(interaction, owner_id):
@@ -15,39 +17,19 @@ def _can_manage(interaction, owner_id):
 
 
 class DraftModal(discord.ui.Modal):
-    def __init__(self, view, kind):
-        super().__init__(title={"basic": "Strategy details", "roles": "Player assignments",
-                                "links": "Utility and links", "diagram": "Tactical diagram"}[kind], timeout=600)
-        self.owner_view, self.kind = view, kind
+    def __init__(self, view):
+        super().__init__(title="Playbook details", timeout=600)
+        self.owner_view = view
         self.draft_token = view.draft_token
         draft = view.draft
-        if kind == "basic":
-            fields = [("name", "Strategy name", draft.get("name", ""), 80, True, False),
-                      ("objective", "Objective", draft.get("objective", ""), 4000, False, True),
-                      ("steps", "Steps: one per line", "\n".join(draft.get("steps", [])), 4000, False, True)]
-        elif kind == "roles":
-            fields = [("assignments", "role | player | agent | position | task | utility",
-                       "\n".join(" | ".join(a.get(k, "") for k in ("role", "player", "agent", "starting_position", "responsibilities", "utility"))
-                                 for a in draft.get("assignments", [])), 4000, False, True)]
-        elif kind == "links":
-            fields = [("utility", "Utility instructions", draft.get("utility", ""), 2000, False, True),
-                      ("links", "Links: one URL per line", "\n".join(draft.get("links", [])), 4000, False, True)]
-        else:
-            diagram = draft.get("diagram") or {}
-            fields = [("image_url", "Optional tactical image URL", diagram.get("image_url", ""), 500, False, False),
-                      ("markers", "Markers JSON (empty removes markers)",
-                       json.dumps(diagram.get("markers", []), ensure_ascii=False, separators=(",", ":")) if diagram.get("markers") else "",
-                       4000, False, True)]
+        objective = draft.get("objective", "")
+        fields = [("name", "Title", draft.get("name", ""), 80, True, False),
+                  ("objective", "Short description", objective, max(500, len(objective)), True, True)]
         self.inputs = {}
         for key, label, default, maximum, required, multiline in fields:
-            if len(default) > maximum:
+            if len(default) > min(maximum, 4000):
                 raise PlaybookDataError(f"Existing {label} exceeds the edit form limit; data was not changed")
-            placeholder = None
-            if key == "markers":
-                placeholder = '[{"kind":"player","x":0.25,"y":0.4,"label":"1"}]'
-            elif key == "assignments":
-                placeholder = "Entry | Player | Jett | A main | Enter site | Dash"
-            field = discord.ui.TextInput(label=label[:45], default=default, placeholder=placeholder, required=required, max_length=maximum,
+            field = discord.ui.TextInput(label=label[:45], default=default, required=required, max_length=min(maximum, 4000),
                                          style=discord.TextStyle.paragraph if multiline else discord.TextStyle.short)
             self.inputs[key] = field
             self.add_item(field)
@@ -59,47 +41,69 @@ class DraftModal(discord.ui.Modal):
             return await interaction.response.send_message("This editing session has expired or you lack administrator permission.", ephemeral=True)
         candidate = copy.deepcopy(view.draft)
         try:
-            if self.kind == "basic":
-                candidate.update(name=self.inputs["name"].value, objective=self.inputs["objective"].value,
-                                 steps=[line.strip() for line in self.inputs["steps"].value.splitlines() if line.strip()])
-            elif self.kind == "roles":
-                assignments = []
-                for line in self.inputs["assignments"].value.splitlines():
-                    if not line.strip():
-                        continue
-                    parts = [part.strip() for part in line.split("|")]
-                    if len(parts) > 6:
-                        raise PlaybookDataError("Each assignment needs at most six fields separated by |")
-                    keys = ("role", "player", "agent", "starting_position", "responsibilities", "utility")
-                    assignments.append(dict(zip(keys, parts)))
-                candidate["assignments"] = assignments
-            elif self.kind == "links":
-                candidate.update(utility=self.inputs["utility"].value,
-                                 links=[line.strip() for line in self.inputs["links"].value.splitlines() if line.strip()])
-            else:
-                raw = self.inputs["markers"].value.strip()
-                markers = json.loads(raw) if raw else []
-                url = self.inputs["image_url"].value.strip()
-                candidate["diagram"] = {"markers": markers, "image_url": url} if markers or url else None
-            view.draft = validate_draft(candidate, allow_legacy=view.original and view.original["side"] == "legacy")
-        except (PlaybookDataError, ValueError) as exc:
+            title, description = self.inputs["name"].value.strip(), self.inputs["objective"].value
+            if not title or not description.strip():
+                raise PlaybookDataError("Enter a title and short description")
+            if len(description) > 500 and (not view.original or description != view.original.get("objective")):
+                raise PlaybookDataError("The short description must be 500 characters or fewer")
+            candidate.update(name=title, objective=description)
+            view.draft = candidate
+        except PlaybookDataError as exc:
             return await interaction.response.send_message(f"Could not update draft: {_safe(exc)}", ephemeral=True)
         view.draft_token += 1
         view.preview_page = 0
         view.refresh()
-        await interaction.response.edit_message(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
+        embed, attachments = view.preview_content()
+        await interaction.response.edit_message(embed=embed, view=view, attachments=attachments,
+                                                allowed_mentions=discord.AllowedMentions.none())
+
+
+class ImageUploadModal(discord.ui.Modal):
+    def __init__(self, view):
+        super().__init__(title="Upload tactical image", timeout=600)
+        self.owner_view, self.draft_token = view, view.draft_token
+        self.upload = discord.ui.FileUpload(required=True, min_values=1, max_values=1)
+        self.add_item(discord.ui.Label(text="Image file", description="PNG, JPEG or WebP, up to 8 MiB and 8 megapixels.",
+                                       component=self.upload))
+
+    async def on_submit(self, interaction):
+        view = self.owner_view
+        if (not _can_manage(interaction, view.owner_id) or view.is_finished()
+                or view.draft is None or view.draft_token != self.draft_token):
+            return await interaction.response.send_message("This editing session has expired or changed.", ephemeral=True)
+        if len(self.upload.values) != 1:
+            return await interaction.response.send_message("Choose one image file.", ephemeral=True)
+        attachment = self.upload.values[0]
+        if attachment.size > MAX_IMAGE_BYTES:
+            return await interaction.response.send_message("Image must be at most 8 MiB.", ephemeral=True)
+        await interaction.response.defer()
+        try:
+            data = await attachment.read()
+            asset_name = await asyncio.to_thread(validate_image, data)
+        except PlaybookDataError:
+            return await interaction.followup.send("Invalid image. Use a PNG, JPEG or WebP up to 8 MiB and 8 megapixels.", ephemeral=True)
+        except Exception:
+            return await interaction.followup.send("Could not download the attachment. Please try again.", ephemeral=True)
+        if view.is_finished() or view.draft is None or view.draft_token != self.draft_token:
+            return await interaction.followup.send("The draft changed while the image was uploading; nothing was replaced.", ephemeral=True)
+        view.pending_image = data
+        view.pending_extension = asset_name.rsplit(".", 1)[-1]
+        view.draft_token += 1
+        view.refresh()
+        await view.edit_deferred(interaction)
 
 
 class PlaybookAdminView(discord.ui.View):
-    def __init__(self, service, maps, owner_id, initial_map=None, initial_notes="", initial_links="", lineup_loader=None):
+    def __init__(self, service, maps, owner_id, initial_map=None):
         super().__init__(timeout=900)
         self.service, self.maps, self.owner_id = service, maps, owner_id
         self.map_name, self.side = initial_map, None
         self.map_page = self.list_page = self.preview_page = 0
         self.draft = self.original = self.selected = None
         self.draft_token = 0
-        self.initial_notes, self.initial_links = initial_notes, initial_links
-        self.lineup_loader = lineup_loader
+        self.pending_image = None
+        self.pending_extension = "png"
+        self.remove_existing_image = False
         self.confirm_delete = False
         self.message = None
         self.refresh()
@@ -128,7 +132,32 @@ class PlaybookAdminView(discord.ui.View):
 
     async def update(self, interaction):
         self.refresh()
-        await interaction.response.edit_message(embed=self.embed(), view=self, allowed_mentions=discord.AllowedMentions.none())
+        embed, attachments = self.preview_content()
+        await interaction.response.edit_message(embed=embed, view=self, attachments=attachments,
+                                                allowed_mentions=discord.AllowedMentions.none())
+
+    async def edit_deferred(self, interaction):
+        embed, attachments = self.preview_content()
+        await interaction.edit_original_response(embed=embed, view=self, attachments=attachments,
+                                                 allowed_mentions=discord.AllowedMentions.none())
+
+    def preview_content(self):
+        embed = self.embed()
+        image = None
+        if self.draft is not None:
+            if self.pending_image:
+                image = discord.File(io.BytesIO(self.pending_image), filename=f"playbook-preview.{self.pending_extension}")
+            else:
+                name = (self.draft.get("diagram") or {}).get("image_asset")
+                try:
+                    path = self.service.image_path(name) if name else None
+                    if path and path.is_file():
+                        image = discord.File(path, filename="playbook-preview" + path.suffix)
+                except (OSError, PlaybookDataError):
+                    pass
+        if image:
+            embed.set_image(url=f"attachment://{image.filename}")
+        return embed, [image] if image else []
 
     def add_action(self, label, row, callback, style=discord.ButtonStyle.secondary, disabled=False):
         button = discord.ui.Button(label=label, row=row, style=style, disabled=disabled)
@@ -138,54 +167,49 @@ class PlaybookAdminView(discord.ui.View):
     def refresh(self):
         self.clear_items()
         if self.draft is not None:
-            for label, kind in (("Details", "basic"), ("Assignments", "roles"), ("Utility & links", "links"), ("Diagram", "diagram")):
-                async def open_modal(interaction, modal_kind=kind):
-                    try:
-                        await interaction.response.send_modal(DraftModal(self, modal_kind))
-                    except PlaybookDataError as exc:
-                        await interaction.response.send_message(_safe(exc), ephemeral=True)
-                self.add_action(label, 0, open_modal)
-            if self.lineup_loader:
-                async def import_lineup(interaction):
-                    if self.draft.get("assignments"):
-                        return await interaction.response.send_message("Clear draft assignments before importing a lineup.", ephemeral=True)
-                    token = self.draft_token
-                    await interaction.response.defer()
-                    try:
-                        assignments = await self.lineup_loader(self.map_name, interaction.guild)
-                    except PlaybookDataError as exc:
-                        return await interaction.followup.send(_safe(exc), ephemeral=True)
-                    except Exception:
-                        return await interaction.followup.send("Could not read this map's lineup.", ephemeral=True)
-                    if not assignments:
-                        return await interaction.followup.send("No agent lineup is set for this map.", ephemeral=True)
-                    if len(assignments) > 5:
-                        return await interaction.followup.send("The lineup has more than five players; edit it before importing.", ephemeral=True)
-                    if self.draft is None or self.draft_token != token or self.draft.get("assignments"):
-                        return await interaction.followup.send("The draft changed while importing; no assignments were replaced.", ephemeral=True)
-                    self.draft["assignments"] = assignments
-                    self.draft_token += 1
-                    self.refresh()
-                    await interaction.edit_original_response(embed=self.embed(), view=self,
-                                                             allowed_mentions=discord.AllowedMentions.none())
-                self.add_action("Import lineup", 0, import_lineup)
+            async def open_modal(interaction):
+                try:
+                    await interaction.response.send_modal(DraftModal(self))
+                except PlaybookDataError as exc:
+                    await interaction.response.send_message(_safe(exc), ephemeral=True)
+            self.add_action("Title & description", 0, open_modal)
             async def save(interaction):
                 try:
+                    if not self.draft.get("objective", "").strip():
+                        raise PlaybookDataError("Enter a short description before saving")
                     if self.original:
-                        saved = self.service.update(self.original["id"], self.original["revision"], self.draft)
+                        saved = self.service.update_details(self.original["id"], self.original["revision"],
+                            self.draft.get("name", ""), self.draft.get("objective", ""),
+                            self.pending_image, self.remove_existing_image)
                     else:
-                        saved = self.service.create(self.draft)
+                        saved = self.service.create(self.draft, self.pending_image)
                 except PlaybookDataError as exc:
                     return await interaction.response.send_message(_safe(exc), ephemeral=True)
                 self.selected, self.draft, self.original = saved["id"], None, None
+                self.pending_image = None
+                self.remove_existing_image = False
                 self.draft_token += 1
                 await self.update(interaction)
             async def cancel(interaction):
                 self.draft = self.original = None
+                self.pending_image = None
+                self.remove_existing_image = False
                 self.draft_token += 1
                 await self.update(interaction)
             self.add_action("Save strategy", 1, save, discord.ButtonStyle.success)
             self.add_action("Cancel draft", 1, cancel, discord.ButtonStyle.danger)
+            async def upload_image(interaction):
+                await interaction.response.send_modal(ImageUploadModal(self))
+            async def remove_image(interaction):
+                self.pending_image = None
+                self.remove_existing_image = True
+                diagram = self.draft.get("diagram") or {}
+                markers = diagram.get("markers") or []
+                self.draft["diagram"] = {"markers": markers, "image_url": "", "image_asset": ""} if markers else None
+                self.draft_token += 1
+                await self.update(interaction)
+            self.add_action("Upload image", 2, upload_image)
+            self.add_action("Remove image", 2, remove_image)
             page_count = len(strategy_pages(self.draft))
             for label, delta in (("Previous page", -1), ("Next page", 1)):
                 async def change_preview(interaction, change=delta):
@@ -254,9 +278,11 @@ class PlaybookAdminView(discord.ui.View):
             self.add_item(select)
         async def new(interaction):
             self.original = None
+            self.pending_image = None
+            self.remove_existing_image = False
             self.draft_token += 1
-            self.draft = {"name": "", "map": self.map_name, "side": self.side, "objective": self.initial_notes,
-                          "steps": [], "assignments": [], "utility": "", "links": self.initial_links.replace(',', ' ').split(), "diagram": None}
+            self.draft = {"name": "", "map": self.map_name, "side": self.side, "objective": "",
+                          "steps": [], "assignments": [], "utility": "", "links": [], "diagram": None}
             self.preview_page = 0
             await self.update(interaction)
         async def edit(interaction):
@@ -264,6 +290,8 @@ class PlaybookAdminView(discord.ui.View):
             if not original:
                 return await interaction.response.send_message("Strategy was deleted; reopen the list.", ephemeral=True)
             self.original, self.draft = original, copy.deepcopy(original)
+            self.pending_image = None
+            self.remove_existing_image = False
             self.draft_token += 1
             self.preview_page = 0
             await self.update(interaction)
