@@ -26,6 +26,7 @@ from graphics.match_card import draw_play_result
 from graphics.player_history import render_player_history
 from graphics.playbook_card import render_playbook_card, render_strategy_card
 from graphics.rank_change import draw_rank_change_card
+from graphics.recent_scoreboard import render_recent_scoreboard
 from graphics.schedule import render_schedule_card
 from graphics.scoreboard import draw_scoreboard
 from services.cache import JsonCache
@@ -36,6 +37,7 @@ from services.matchfeed import format_match_notification, group_registered_playe
 from services.playbook_service import PlaybookDataError, PlaybookService
 from services.valorant_api import HenrikDevClient
 from utils.formatting import fmt_range, parse_time
+from utils.recent_scoreboard import has_half_data
 from utils.statistics import summarise_match
 
 TOKEN = SETTINGS.discord_token
@@ -1409,7 +1411,70 @@ async def test_rank_card(interaction: discord.Interaction, scenario: app_command
     )
 
 
-@tree.command(name="recent", description="Show a player's most recent competitive match card")
+class RecentScoreboardView(discord.ui.View):
+    """Switch match periods using the match data already loaded for the message."""
+
+    def __init__(self, detail, target, map_path, agent_icons, rank_icons):
+        super().__init__(timeout=900)
+        self.detail, self.target, self.map_path = detail, target, map_path
+        self.agent_icons, self.rank_icons = agent_icons, rank_icons
+        if not has_half_data(detail):
+            self.first.disabled = True
+            self.second.disabled = True
+
+    async def card(self, period):
+        loop = asyncio.get_running_loop()
+        buffer = await loop.run_in_executor(None, render_recent_scoreboard, self.detail, self.target,
+                                            period, self.map_path, self.agent_icons, self.rank_icons)
+        return discord.File(buffer, filename="scoreboard.png")
+
+    async def switch(self, interaction, period):
+        await interaction.response.defer()
+        card = await self.card(period)
+        await interaction.edit_original_response(attachments=[card], view=self)
+
+    @discord.ui.button(label="Full match", style=discord.ButtonStyle.secondary)
+    async def full(self, interaction, button):
+        await self.switch(interaction, "full")
+
+    @discord.ui.button(label="First half", style=discord.ButtonStyle.secondary)
+    async def first(self, interaction, button):
+        await self.switch(interaction, "first")
+
+    @discord.ui.button(label="Second half + OT", style=discord.ButtonStyle.secondary)
+    async def second(self, interaction, button):
+        await self.switch(interaction, "second")
+
+
+async def recent_scoreboard_view(detail, target):
+    map_data = (detail.get("metadata") or {}).get("map") or {}
+    map_id = map_data.get("id") or map_data.get("uuid")
+    path = await map_background_path(map_id, map_data.get("name", "Unknown")) if map_id else None
+    try:
+        catalog = await icon_maps()
+    except Exception as exc:
+        print(f"Recent scoreboard icon catalog unavailable: {exc}")
+        catalog = {}
+    by_name = {name.casefold(): agent_id for agent_id, name in catalog.get("agent_names", {}).items()}
+    agent_urls = {}
+    tier_urls = {}
+    for player in detail.get("players") or []:
+        agent = player.get("agent") or {}
+        agent_id = str(agent.get("id") or agent.get("uuid") or by_name.get(str(agent.get("name") or "").casefold()) or "").lower()
+        if agent_id and player.get("puuid"):
+            agent_urls[player["puuid"]] = catalog.get("agents", {}).get(agent_id) or f"https://media.valorant-api.com/agents/{agent_id}/displayicon.png"
+        tier_id = str((player.get("tier") or {}).get("id") or "")
+        if tier_id and catalog.get("tiers", {}).get(tier_id):
+            tier_urls[tier_id] = catalog["tiers"][tier_id]
+    agent_images, tier_images = await asyncio.gather(
+        asyncio.gather(*(icon_img(url, 55) for url in agent_urls.values())),
+        asyncio.gather(*(icon_img(url, 40) for url in tier_urls.values())),
+    )
+    return RecentScoreboardView(detail, target, path, dict(zip(agent_urls, agent_images)),
+                                dict(zip(tier_urls, tier_images)))
+
+
+@tree.command(name="recent", description="Show a player's most recent competitive match scoreboard")
 @app_commands.describe(player="Mention a member with a linked account (defaults to you)")
 async def recent_cmd(interaction: discord.Interaction, player: discord.Member = None):
     target = player or interaction.user
@@ -1448,28 +1513,9 @@ async def recent_cmd(interaction: discord.Interaction, player: discord.Member = 
                                   if f"{p.get('name', '')}#{p.get('tag', '')}".casefold() == wanted), None)
         if not target_player:
             return await interaction.followup.send("I found the match, but couldn't match the linked account to its scoreboard.")
-        team_id = target_player.get("team_id")
-        teammates = [p for p in participants if p.get("team_id") == team_id]
-        registered_keys = {f"{account['name']}#{account['tag']}".casefold()}
-        teammate_keys = {f"{p.get('name', '')}#{p.get('tag', '')}".casefold() for p in teammates}
-        if interaction.guild:
-            for user_id, linked_account in accounts.items():
-                key = f"{linked_account.get('name', '')}#{linked_account.get('tag', '')}".casefold()
-                if key not in teammate_keys or key in registered_keys:
-                    continue
-                try:
-                    member = interaction.guild.get_member(int(user_id))
-                    if member is None:
-                        member = await interaction.guild.fetch_member(int(user_id))
-                except (ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    continue
-                if member:
-                    registered_keys.add(key)
-        registered_players = [p for p in teammates
-                              if p is target_player or f"{p.get('name', '')}#{p.get('tag', '')}".casefold() in registered_keys]
-        card = await play_match_image(detail, registered_players, teammates, target_player,
-                                      summary_players=registered_players)
-        await interaction.followup.send(file=card, allowed_mentions=discord.AllowedMentions.none())
+        view = await recent_scoreboard_view(detail, target_player)
+        card = await view.card("full")
+        await interaction.followup.send(file=card, view=view, allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         await interaction.followup.send(f"Couldn't load the recent match: {str(exc)[:300]}")
 

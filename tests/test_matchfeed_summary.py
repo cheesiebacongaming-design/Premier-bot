@@ -53,7 +53,7 @@ async def test_matchfeed_card_sends_registered_players_to_summary_only(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_recent_shows_only_registered_guild_teammates(monkeypatch):
+async def test_recent_displays_full_scoreboard(monkeypatch):
     monkeypatch.setenv("DISCORD_TOKEN", "test-token")
     monkeypatch.setenv("HENRIK_API_KEY", "test-key")
     import bot
@@ -73,12 +73,12 @@ async def test_recent_shows_only_registered_guild_teammates(monkeypatch):
     monkeypatch.setattr(bot, "load_accounts", lambda: accounts)
     monkeypatch.setattr(bot, "cached_api", AsyncMock(return_value=[{"meta": {"id": "m1"}, "stats": {"puuid": "p1"}}]))
     monkeypatch.setattr(bot, "cached", AsyncMock(return_value={"players": team}))
-    render = AsyncMock(return_value=object())
-    monkeypatch.setattr(bot, "play_match_image", render)
+    view = SimpleNamespace(card=AsyncMock(return_value=object()))
+    render = AsyncMock(return_value=view)
+    monkeypatch.setattr(bot, "recent_scoreboard_view", render)
 
     await bot.recent_cmd.callback(interaction)
 
-    assert render.await_args.args[1] == [friend, teammate]
-    assert render.await_args.args[2] == team
-    assert render.await_args.kwargs["summary_players"] == [friend, teammate]
+    assert render.await_args.args == ({"players": team}, friend)
+    view.card.assert_awaited_once_with("full")
     interaction.followup.send.assert_awaited_once()
